@@ -1,0 +1,30 @@
+# Caches and build artifacts — never commit these.
+# The dataset (2.3 GB) and generated TSVs (500 MB+) are far too large for git.
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+.ipynb_checkpoints/
+
+# Pipeline caches: parquet, memmaps, models, logs. Regenerate with run.py.
+work/
+work_dev/
+**/work/
+**/work_dev/
+*.log
+
+# Large data: provided dataset and generated submissions
+student_resource/dataset/
+output/*.tsv
+baseline/**/*.tsv
+*.zip
+
+# OS
+.DS_Store
+
+# Keep the docs and code. Explicitly re-include small things that matter.
+!student_resource/README.md
+!student_resource/Documentation_template.md
+!student_resource/utils/

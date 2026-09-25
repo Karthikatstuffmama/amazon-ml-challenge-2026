@@ -1,0 +1,7 @@
+# Optional GPU pass (--dense). Install torch FIRST from the CUDA 12.8 index
+# (required for RTX 50-series / Blackwell sm_120):
+#   pip install torch==2.7.1 --index-url https://download.pytorch.org/whl/cu128
+# then:
+sentence-transformers==3.3.1     # Apache-2.0
+transformers==4.46.3             # Apache-2.0
+# model: intfloat/multilingual-e5-small (MIT, 118M params) - downloaded once from HF hub
