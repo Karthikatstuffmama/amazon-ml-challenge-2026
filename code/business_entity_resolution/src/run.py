@@ -17,6 +17,14 @@ import time
 # See dense.py for why this must be set before any `import torch` (Windows cu12x DLL
 # load can otherwise fail with "paging file is too small" even with ample RAM/CUDA_MODULE_LOADING).
 os.environ.setdefault("CUDA_MODULE_LOADING", "LAZY")
+# Max out BLAS / OpenMP for rapidfuzz + LightGBM on Apple Silicon / Linux.
+_nthreads = max(1, (os.cpu_count() or 4) - 1)
+os.environ.setdefault("OMP_NUM_THREADS", str(_nthreads))
+os.environ.setdefault("MKL_NUM_THREADS", str(_nthreads))
+os.environ.setdefault("OPENBLAS_NUM_THREADS", str(_nthreads))
+os.environ.setdefault("VECLIB_MAXIMUM_THREADS", str(_nthreads))
+os.environ.setdefault("NUMEXPR_NUM_THREADS", str(_nthreads))
+os.environ.setdefault("PYTORCH_MPS_HIGH_WATERMARK_RATIO", "0.0")
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -43,9 +51,22 @@ def parse_args(argv=None):
     ap.add_argument("--keep-intermediates", action="store_true",
                     help="keep large per-partition feat_*/s2_*.npy caches after they are "
                     "consumed (default: delete them to bound disk use — see config.py)")
-    ap.add_argument("--dense", action="store_true", help="enable GPU multilingual kNN pass")
+    ap.add_argument("--dense", action=argparse.BooleanOptionalAction, default=True,
+                    help="multilingual embedding kNN (default on; --no-dense to disable)")
+    ap.add_argument("--dense-model", default=None,
+                    help="sentence-transformers model id (default multilingual-e5-small)")
+    ap.add_argument("--dense-batch", type=int, default=None,
+                    help="pin encode batch and skip the batch-size probe")
     ap.add_argument("--k-key", type=int, default=None)
     ap.add_argument("--k-dense", type=int, default=None)
+    ap.add_argument("--k-dense-script", type=int, default=None,
+                    help="also keep non-Latin dense neighbors out to this rank (default 50, 0=off)")
+    ap.add_argument("--bm25-k", type=int, default=None,
+                    help="union schema-agnostic BM25 top-k into blocking (default 5, 0=off)")
+    ap.add_argument("--bm25-k-empty", type=int, default=None,
+                    help="also keep empty-address BM25 neighbors out to this rank (0=off)")
+    ap.add_argument("--max-df-pair", type=int, default=None)
+    ap.add_argument("--max-df-name", type=int, default=None)
     ap.add_argument("--dev-frac", type=float, default=None,
                     help="entity-consistent train sub-sample for fast iteration (e.g. 0.1)")
     ap.add_argument("--train-countries", default="",
@@ -71,6 +92,21 @@ def build_config(a) -> Config:
         cfg.k_key = a.k_key
     if a.k_dense is not None:
         cfg.k_dense = a.k_dense
+    if a.k_dense_script is not None:
+        cfg.k_dense_script = a.k_dense_script
+    if a.bm25_k is not None:
+        cfg.bm25_k = a.bm25_k
+    if a.bm25_k_empty is not None:
+        cfg.bm25_k_empty = a.bm25_k_empty
+    if a.dense_model:
+        cfg.dense_model = a.dense_model
+    if a.dense_batch is not None:
+        cfg.dense_batch = a.dense_batch
+        cfg.dense_batch_fixed = True
+    if a.max_df_pair is not None:
+        cfg.max_df_pair = a.max_df_pair
+    if a.max_df_name is not None:
+        cfg.max_df_name = a.max_df_name
     if a.dev_frac is not None:
         cfg.dev_frac = a.dev_frac
     if a.train_countries:
@@ -175,6 +211,12 @@ def main(argv=None):
             evaluate(cfg)
     if a.command in ("train", "all"):
         stage_prepare_block_features(cfg, "train")
+        # Torch's OpenMP pool and LightGBM's libomp deadlock on macOS if both run
+        # in one process (Dataset construction waits forever on a join barrier).
+        # Re-exec after the cached blocking pass so training starts with a clean pool.
+        if "torch" in sys.modules:
+            LOG.info("re-exec without torch so LightGBM's OpenMP does not deadlock")
+            os.execv(sys.executable, [sys.executable, *sys.argv])
         with timed("train"):
             train_all(cfg)
     if a.command in ("predict", "all"):

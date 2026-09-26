@@ -160,20 +160,148 @@ Targets: **0.986** = top 10. **~0.999** = measured ceiling.
   +0.003 realized** — below the +0.005 gate on its own. Next step is implementing the union in
   `blocking.py` and measuring *realized* `holdout_stage2_f05`.
 
+### 2026-09-26 — Looser max_df caps (2000/800) — NEGATIVE / FLAT
+- **Hypothesis:** raising `max_df_pair`/`max_df_name` recovers pairs whose only shared tokens are common (FINDINGS: 99.92% of misses share a token).
+- **Change:** `--max-df-pair 2000 --max-df-name 800` (defaults 500/200). No BM25/dense.
+- **Command:** `src/run.py train --work-dir work_exp_maxdf --dev-frac 0.03 --keep-intermediates --max-df-pair 2000 --max-df-name 800`
+- **Before → After:** holdout_stage2_f05 0.983787 → **0.983762 (−0.000025)**
+  - blocking_recall 0.974226 → 0.974183 | oracle_f05 0.990727 → 0.990706 | pairs_per_s1 20.94 → 21.33
+  - per-country: US 0.989606 → 0.989655, India 0.974928 → 0.974791
+- **Verdict:** **REVERT.** Top-K=40 still discards; looser df alone does not help on this slice.
+
+### 2026-09-26 — k_key=60 — SMALL POSITIVE, costly candidates
+- **Hypothesis:** raising top-K recovers more of the reachable misses.
+- **Change:** `--k-key 60` (default 40).
+- **Command:** `src/run.py train --work-dir work_exp_k60 --dev-frac 0.03 --keep-intermediates --k-key 60`
+- **Before → After:** holdout_stage2_f05 0.983787 → **0.984196 (+0.000409)**
+  - blocking_recall 0.974226 → 0.975629 | oracle_f05 0.990727 → 0.991226 | pairs_per_s1 20.94 → **26.13** (+25%)
+  - per-country: US 0.989606 → 0.989745, India 0.974928 → 0.975747
+- **Verdict:** **WEAK KEEP / prefer BM25.** Gain is real but tiny vs +24% candidates (graded).
+
+### 2026-09-26 — BM25 union top-5 into blocking — KEEP (best so far)
+- **Hypothesis:** union complementary BM25 top-5 with key blocking (measured oracle +0.003026).
+- **Change:** implemented `bm25_k` in `blocking.py` / `config.py` / `run.py --bm25-k`; feature `bit_bm25`.
+- **Command:** `src/run.py train --work-dir work_exp_bm25 --dev-frac 0.03 --keep-intermediates --bm25-k 5`
+- **Before → After:** holdout_stage2_f05 0.983787 → **0.986418 (+0.002631)**
+  - blocking_recall 0.974226 → **0.981824** | oracle_f05 0.990727 → **0.993753** | pairs_per_s1 20.94 → **22.18** (+5.9%)
+  - per-country: US 0.989606 → **0.991420**, India 0.974928 → **0.978802**
+- **Verdict:** **KEEP.** Realized gain matches the probe (+0.0026). Best single lever measured. Still below +0.005 gate alone — stack with `--dense` next.
+
+### 2026-09-26 — `--dense` (e5-small, k_dense=15) alone — KEEP (new best)
+- **Hypothesis:** multilingual-e5 embeds Devanagari+Latin; was OFF in every prior run; targets 37% non-Latin blocking misses.
+- **Change:** `--dense` only (`bm25_k=0`). MPS encode on M5 Air; train resumed from cache after OOM mid-LightGBM.
+- **Command:** `src/run.py train --work-dir work_exp_dense --dev-frac 0.03 --keep-intermediates --dense`
+- **Before → After:** holdout_stage2_f05 0.983787 → **0.990239 (+0.006452)**
+  - blocking_recall 0.974226 → **0.993373** | oracle_f05 0.990727 → **0.997942** | pairs_per_s1 20.94 → **31.10** (+48%)
+  - per-country: US 0.989606 → 0.991871, India 0.974928 → **0.987754** (+0.0128)
+- **Verdict:** **KEEP — new champion on the 3% slice.** Clears the +0.005 gate alone. Candidate cost is high (31/S1); next: stack BM25∪dense then CNP/meta-block to shrink pairs, and confirm at `--dev-frac 0.3`.
+
+---
+
+## Leaderboard (dev 0.03, dense OFF baseline = 0.983787)
+
+| Config | F₀.₅ | Δ | pairs/S1 | Verdict |
+|---|---|---|---|---|
+| baseline | 0.983787 | — | 20.9 | ref |
+| max_df 2000/800 | 0.983762 | −0.00003 | 21.3 | REVERT |
+| k_key=60 | 0.984196 | +0.00041 | 26.1 | weak |
+| BM25 k=5 | 0.986418 | +0.00263 | 22.2 | KEEP |
+| `--dense` k=15 | 0.990239 | +0.00645 | 31.1 | KEEP |
+| BM25 k=5 ∪ dense k=15 | 0.991003 | +0.00722 | 32.2 | KEEP |
+| **+ non-Latin dense to rank 50** | **0.991332** | **+0.00754** | **34.2** | **BEST** |
+
+---
+
+### 2026-09-26 — BM25 top-5 ∪ dense k=15 — KEEP (new best)
+- **Hypothesis:** the two retrievers miss different pairs, so the union raises the candidate ceiling above dense alone.
+- **Change:** `--dense --bm25-k 5` together. Reused the 3% prepare + e5 embeddings from `work_exp_dense`. BM25 hit collection is vectorized; a 1.2 GB gemm chunk was slower than chunk 400 on 16 GB, so chunk stays 400. Do not export `OMP_NUM_THREADS=10` together with `OPENBLAS_NUM_THREADS=10` — that deadlocks LightGBM's OpenMP barrier on this Mac.
+- **Command:** `src/run.py train --work-dir work_exp_stack --dev-frac 0.03 --keep-intermediates --dense --bm25-k 5 --dense-batch 256`
+- **Before → After:** holdout_stage2_f05 0.983787 → **0.991003 (+0.007216)**; vs dense-alone 0.990239 (**+0.000764**)
+  - blocking_recall 0.974226 → **0.994474** | oracle_f05 0.990727 → **0.998353** | pairs_per_s1 20.94 → **32.22**
+  - per-country: US 0.989606 → **0.992319**, India 0.974928 → **0.988999**
+  - stage-2 AUC still ~0.99997. Decision `expected_f τ=0.02 γ=0.6 miss=0.1`
+- **Verdict:** **KEEP.** Best 3% number. Realized gain over dense is small because ranking was already solved; the oracle moved much more (0.9984), so the leftover is group-size selection, not another embedder.
+- **Notes:** Cached resume of train-only was 1.4 min. Cold blocking on this slice was ~2.5 min (BM25 dominates).
+
 ---
 
 ## Next up (highest measured value first)
 
 | # | Action | Why | Expected |
 |---|---|---|---|
-| 1 | **Union BM25 top-5 into blocking** (`blocking.py`) | **measured**: +0.003026 oracle ceiling for +1.24 cands/entity; rescues 29.5% of misses | **+0.002–0.003 realized** |
-| 2 | **`--dense`** (already implemented, was OFF) | e5-small embeds Devanagari + Latin in one space → hits the 37% non-Latin misses | recall ↑, **cheap, test next** |
-| 3 | Mined Devanagari→English token table | phonetic transliteration cannot bridge `पावर`/`power`; note `n_translit` already exists in the pipeline | recall ↑ |
-| 4 | Adaptive `max_df` caps + split K budgets for address vs name keys | 99.92% of misses were reachable; the two failure modes are disjoint | recall ↑ |
-| 5 | Per-entity group-size head (predict n_S2, n_S3, clip to caps) | the only decision lever with headroom (0.0065) | up to +0.006 |
-| 6 | Meta-blocking edge pruning (CEP/CNP) to shrink the candidate set | candidate size is graded; 21 cands for 3.46 true matches | size ↓ |
-| 7 | `address_UPPERCASED` as a source-identity feature | 53.35% of S2 vs 0.01% of S3, currently unused | small |
-| 8 | Precision work | only 7.8% of errors | last |
+| 1 | ~~`--dense`~~ | **DONE: +0.00645** | KEEP |
+| 2 | ~~BM25 top-5~~ | **DONE: +0.00263** | KEEP |
+| 3 | ~~Stack BM25 ∪ dense~~ | **DONE: 0.991003** | KEEP |
+| 4 | Confirm stack at `--dev-frac 0.3` | promotion gate | must survive scale |
+| 5 | Predict n_S2 / n_S3 per entity | oracle 0.9984 vs realized 0.9910 | up to ~+0.007 |
+| 6 | Meta-blocking / lower `k_dense` | pairs 32 is graded | size ↓ |
+| 7 | Granite-embedding-97m-multilingual-r2 | Apache, higher MTEB than e5-small; **unmeasured here** | maybe recall ↑ |
 
-**Accumulation note:** items 1–4 are all recall plays and should be stacked, then measured
-together against the +0.005 gate before any full run.
+**Winner so far:** **BM25∪dense∪script@50∪empty-BM25@40∪housenum p-adjust** (0.991732).
+
+### 2026-09-26 — Winning stack is now the default
+- **Change:** `run.py all` uses `dense=True`, `bm25_k=5`, `k_dense_script=50` unless overridden. `--no-dense` turns embeddings off. Smoke test still passes `--no-dense --bm25-k 0 --k-dense-script 0`.
+- **Score:** no new measurement. This is the config that scored **0.991332** on the 3% slice (`work_exp_script` plus the BM25 union already inside that run).
+- **Verdict:** KEEP. A full `run.py all` now trains that pipeline.
+
+### 2026-09-26 — Deeper BM25 for empty-address index rows — KEEP (small)
+- **Hypothesis:** residual blocking misses with an empty address have median BM25 rank **33** and ~55% sit inside rank 50; `bm25_k=5` keeps none of them. Dense cannot save them (median dense rank 184).
+- **Change:** `bm25_k_empty=40` keeps BM25 rank&lt;5 always, and ranks 5–39 when the *index* address is empty. Default on. `--bm25-k-empty 0` disables.
+- **Command:** `src/run.py train --work-dir work_exp_bm25_empty --dev-frac 0.03 --keep-intermediates --bm25-k-empty 40` (embeddings reused from `work_exp_script`)
+- **Before → After:** holdout_stage2_f05 0.991332 → **0.991548 (+0.000216)**
+  - blocking_recall 0.995359 → **0.996762** | oracle_f05 0.998741 → **0.999062** | pairs_per_s1 34.17 → **36.79**
+  - blocking_miss errors 215 → **150**; empty-addr share of misses 54% → **35%**
+  - per-country: US 0.992385 → **0.992589**, India 0.989728 → **0.989962**
+- **Verdict:** **KEEP.** Real, small. Perfect selection is now **0.999**; realized score is still stuck on mid-p near-copies (`missed_in_candidates` is 67% of errors). **1.0 is not reachable** on this slice: the decision gap to oracle-topk is still ~0.007 and no threshold/heuristic closed it.
+- **Notes:** Ceiling clarification — oracle_subset **0.999062**. The leftover to 1.0 is mostly choosing which p≈0.4 near-copy is true, not more blocking.
+
+### 2026-09-26 — House-number boost/pen on calibrated p — KEEP (small)
+- **Hypothesis:** selected FPs have median |Δ first house number|=5; true matches are exact 77% of the time. Boost exact, penalize close-but-unequal.
+- **Change:** before `expected_f`, `p += 0.05` on exact first-`a_nums` match, `p -= 0.05` when 1≤|Δ|≤5. Defaults `housenum_boost=0.05`, `housenum_pen=0.05`. Stored in `decision` meta for predict.
+- **Command:** `src/run.py train --work-dir work_exp_housenum --dev-frac 0.03 --keep-intermediates` (pairs/features reused from `work_exp_bm25_empty`)
+- **Before → After:** holdout_stage2_f05 0.991548 → **0.991732 (+0.000184)**
+  - India 0.989962 → **0.990355**, US 0.992589 → **0.992637** | pairs/oracle unchanged
+- **Verdict:** **KEEP.** Decision-only, no candidate growth. Stacked with empty-addr BM25.
+
+### 2026-09-26 — Group-size head and exact-name force-include — REVERT
+- **Hypothesis:** the +0.0069 oracle-prefix gap is predictable from the score profile, and unique exact names at p≈0.4 are true matches the decision drops.
+- **Change:** none kept. Scores cached at `work_exp_stack/train/scores_all.npz`.
+- **Results:** shipped 0.991003. LightGBM predicting oracle-k from the top-8 probabilities → **0.990279 (−0.000724)**. `round(sum p)` 0.989281. Forcing a unique `n_tset≥0.99` pair in → **0.990699 (−0.000304)**, 39 adds of which only 12 were true. Missed true pairs have median p **0.40** and median name-token overlap **1.0**, the same name overlap as the 173 selected false matches.
+- **Verdict:** **REVERT.** The leftover is which mid-score near-copy is true. The profile does not say. Raw holdout (953 / 13,452 entities, 1,018 errors): missed-in-candidates 587, blocking_miss 256, fp_distractor 140, fp_stolen 20, fp_on_singleton 15. Examples are house-number-off-by-a-few and empty-address copies on both sides of the label.
+
+### 2026-09-26 — Deeper dense neighbors for non-Latin names — KEEP (small)
+- **Hypothesis:** residual blocking misses whose name is non-Latin have median dense rank 29 (66% inside rank 50); k=15 keeps none of them.
+- **Change:** `k_dense_script=50` keeps rank&lt;15 always, and ranks 15–49 when either name has no Latin letter. `--k-dense-script 50`.
+- **Command:** `src/run.py train --work-dir work_exp_script --dev-frac 0.03 --keep-intermediates --dense --bm25-k 5 --k-dense-script 50`
+- **Before → After:** holdout_stage2_f05 0.991003 → **0.991332 (+0.000329)**
+  - blocking_recall 0.994474 → **0.995359** | oracle_f05 0.998353 → **0.998741** | pairs_per_s1 32.22 → **34.17**
+  - per-country: US 0.992319 → 0.992385, India 0.988999 → **0.989728**
+- **Verdict:** **KEEP.** Real, small, and it pushes the perfect-selection ceiling over 0.998. It does not move the realized score to 0.998: that still requires knowing which p≈0.4 near-copy is the true one.
+- **Notes:** Torch and LightGBM deadlock on this Mac if they share a process. `run.py` re-execs after blocking so training starts clean. Embeddings and the score matrix stay cached.
+
+### 2026-09-26 — Cross-encoder rerank ceiling, model held fixed — do not train it
+- **Hypothesis:** a Ditto-style reranker on the shortlist would cut false positives, which zero a singleton and dilute F₀.₅.
+- **Change:** none. `decision_analysis.py` plus a shortlist probe on `work_exp_stack`.
+- **Command:** `src/decision_analysis.py --work-dir work_exp_stack`
+- **Before → After:** shipped holdout **0.990906** (analysis mask; report.json is 0.991003)
+  - best global τ=0.73 → **−0.000381** | per-country τ → **−0.000366**
+  - oracle_topk **0.997831 (+0.006925)** | oracle_subset **0.998353 (+0.007447)**
+  - scorer gap (subset − topk) **+0.000522** — that is all a reranker can gain by reordering
+  - selected pairs: 45,483 true, **175 false**, **15** of them on true singletons
+  - perfect drop of those 175 FPs → **0.994666 (+0.003760)**. An emb_cos × name-token gate could not beat the shipped rule (FP median emb 0.934 and p 0.894, almost on top of the true matches)
+- **Verdict:** **REVERT the idea.** Do not fine-tune the cross-encoder. The FPs are near-copies, not junk the reranker can see and the trees cannot. The larger hole is choosing k per entity (+0.0069), which a shortlist reranker does not do.
+
+### 2026-09-26 — France proxy: train and tune on US only, score India — KEEP as evidence
+- **Hypothesis:** France is 15.0% of test S1 (259,452 / 1,732,544) and has no labels. India left out of both training and decision tuning is the measurable stand-in.
+- **Change:** none to the submission model. `--train-countries us` in `work_exp_loco_us`, then isotonic + `expected_f` refit on US folds only.
+- **Command:** `src/run.py train --work-dir work_exp_loco_us --dev-frac 0.03 --keep-intermediates --dense --bm25-k 5 --train-countries us`
+- **Before → After:** India holdout 0.988999 (in training) → **0.979812** (never in train or tune), **−0.0092**. US holdout stays **0.992313**.
+- **Verdict:** **KEEP (evidence).** An unseen country does not collapse and does not need a looser threshold — that is what creates singleton false positives. French street types and legal suffixes (`rue`, `sarl`, `sas`) are already in `normalize.py`. Keep the US+India decision rule for France. A France-only stricter cut has no label to tune on; the transfer gap, spread over 15% of test S1, is about **0.001** on the leaderboard, smaller than the group-size hole.
+
+### 2026-09-26 — Domain/acronym NC keys — REVERT
+- **Hypothesis:** initials + TLD-stripped squash on NC would recover domain-form misses.
+- **Change:** expanded NC key variants; reverted in `blocking.py`.
+- **Command:** `src/run.py train --work-dir work_exp_domain --dev-frac 0.03 --keep-intermediates`
+- **Before → After:** holdout_stage2_f05 0.991732 → **0.991116 (−0.000617)**
+  - pairs_per_s1 36.79 → **39.52** | blocking_recall flat | oracle flat/down
+- **Verdict:** **REVERT.** More pairs, no recall gain, score down.

@@ -146,7 +146,8 @@ def main() -> int:
         out = os.path.join(tmp, "out")
         cmd = [sys.executable, os.path.join(ROOT, "src", "run.py"), "all",
                "--data-dir", ds, "--work-dir", os.path.join(tmp, "work"),
-               "--out-dir", out]
+               "--out-dir", out, "--no-dense", "--bm25-k", "0",
+               "--k-dense-script", "0", "--bm25-k-empty", "0"]
         print("running:", " ".join(cmd[:3]), "...")
         p = subprocess.run(cmd, capture_output=True, text=True)
         if p.returncode != 0:

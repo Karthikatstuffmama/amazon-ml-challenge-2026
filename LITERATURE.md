@@ -79,28 +79,98 @@ other wins rather than triggering a full run for it alone.
 
 ## Untested but literature-supported (ranked)
 
-1. **Embedding choice for the `--dense` pass.** Zeakis et al. benchmark 12 models for blocking
-   specifically. The pipeline defaults to `multilingual-e5-small` (MIT, 118M). Worth checking
-   their results before assuming it is the right pick — but note `--dense` has *never been run
-   here*, so turning it on at all is the higher-value test.
-2. **Meta-blocking edge pruning** (CEP/CNP/WEP) to *shrink* the candidate set at fixed recall.
-   Directly targets the graded criterion; our 21 candidates/entity for a mean of 3.46 true
-   matches suggests room.
-3. **SC-Block**'s claim of roughly half-size candidate sets. Same graded criterion. Requires
-   training a learned blocker — larger effort, weigh against the blocking work already queued.
+1. **Embedding choice for the `--dense` pass.** Zeakis et al. (PVLDB 2023) find **S-GTR-T5**
+   strongest on English ER blocking benchmarks. That model is English-centric (~1B, Apache-2.0)
+   and does **not** address our Devanagari miss cluster. Keep `multilingual-e5-small` (MIT, 118M)
+   — it is the right family for this data. Turning `--dense` on at all is still the higher-value
+   test; swapping model size (e5-base) is a later A/B.
+2. **Hybrid sparse ∪ dense, not score fusion.** IR practice (RRF / hybrid search) and our own
+   BM25-union measurement agree: when retrievers fail on *different* pairs, **union the
+   candidate sets**. Do not blend BM25/IDF/cosine into one score before top-K — incompatible
+   scales. Cap the union (graded `pairs_per_s1`).
+3. **Meta-blocking edge pruning** (CEP/CNP/WEP) to *shrink* the candidate set at fixed recall.
+   Run this *after* recall expansions (BM25 ∪ dense ∪ adaptive df), not before. CNP (top-k
+   edges per node) fits our per-S1 budget best.
+4. **SC-Block** (learned contrastive blocking) — larger effort; defer until the cheap union +
+   dense + mined-table stack is measured.
 
-## Notes on our data that the literature does not cover
+## Advanced research addendum (2026-09-26) — new probes + transfer notes
 
-- The generator is **synthetic with a finite rule set**, so alias tables should be mined from
-  ground truth rather than hand-written or imported. Published blockers assume natural noise.
-- **One-owner and the count caps (n_S2 ≤ 5, n_S3 ≤ 6) hold exactly** across 7.64M records. This
-  is a much stronger structural constraint than standard ER assumes, and it is under-exploited:
-  the pipeline uses one-owner only as a greedy tie-break.
-- `address_UPPERCASED` separates S2 from S3 almost perfectly (53.35% vs 0.01%) and is currently
-  unused as a feature.
-- The **matching** literature (Ditto, cross-encoders) is low priority here: stage-2 AUC is
-  already 0.99996 and `oracle_topk` ≈ `oracle_subset`, so ranking is effectively solved.
-  Recall, not matching, is the bottleneck.
+### A. Mined Indic→English token table (Sinha / MINT / XLEnt-style) — **transfers, method refined**
+
+Literature (Sinha ACL 2009; MINT; XLEnt LSP-Align) mines name transliterations from parallel
+text via **alignment**, not phonetic romanisation. Our generator is exactly that parallel
+corpus.
+
+**Measured on `work/sample.json` (10k cross-script true pairs):**
+
+| Probe | Result |
+|---|---|
+| Space-split positional align (equal token count) | **10 000 / 10 000** pairs align 1:1 — generator preserves whitespace token cardinality |
+| High-precision mappings (count≥5, 2× runner-up) | **886** script→English entries |
+| Critical failure of `anyascii` | `प्राइवेट` → `praivet` (never matches `private`); `मीडिया`→`midiya`, `पावर`→`pavr` |
+| Correct mined maps | `प्राइवेट`→`private`, `मीडिया`→`media`, `पावर`→`power`, plus Kannada/Telugu/Tamil/Bengali/Gujarati/Malayalam legal-suffix variants |
+
+**Implementation rule:** mine on **original-script space tokens** before `anyascii`; inject the
+English side into blocking name keys (`n_core` / NP/NC). Do **not** use Python `\w` on Indic
+text — virama/matras shatter words into single aksharas (verified: `स्मार्ट` → 4 junk tokens).
+
+**Do not import ParaNames / web dictionaries** (fair-play: no external lookup). GT-mined tables
+only.
+
+### B. Group-size prediction (the real 0.0065 decision headroom)
+
+`decision_analysis.py` closed thresholds: best global τ and per-country τ are **flat/negative**.
+`oracle_topk ≈ oracle_subset` ⇒ ranking is solved; the gap is **choosing k per entity**.
+
+This is the plug-in cardinality problem (F-measure maximisation literature), not Magellan's
+global threshold grid. Concrete recipe consistent with our caps:
+
+1. Features from the calibrated score *profile*: top-11 probs, successive gaps, entropy,
+   `#p>0.9/#p>0.5`, empty-address / non-Latin flags, `address_UPPERCASED` (S2 vs S3).
+2. Predict `(n_S2, n_S3)` (two small heads or one multi-output LightGBM), clip to **5 / 6**.
+3. Take source-aware top-n from the p-sorted list (already one-owner masked).
+
+Expected: up to **+0.006** if prediction is accurate; start with a cheap probe that replaces
+`expected_f` with `top-k*` where `k* = round(sum p)` clipped — that is the first ablation.
+
+### C. Hard constraints still under-used
+
+- One-owner: already greedy in `decide.exclusive_mask`.
+- Caps: baseline submission had **348 entities** with n_S2>5 or n_S3>6 — free false positives.
+  Clip after decision regardless of scores.
+- `address_UPPERCASED` (53% S2 / 0% S3) is not just “unused” — `norm_addr` lowercases via
+  `_ascii`, so the signal is **destroyed before featurization**. Compute it from the **raw**
+  address (e.g. fraction of alpha chars that are uppercase) and pass it as a feature; do not
+  try to recover it from normalized fields.
+- `n_translit` / `n_phon` exist, but translit is only a **boolean flag** and phon cannot bridge
+  Devanagari↔English lexical mismatch — blocking keys never see original-script tokens.
+
+### D. Cross-encoder reranker (`rerank.py`) — **deprioritise**
+
+Already coded (Ditto-style e5 cross-encoder on the shortlist). It can only reshuffle pairs the
+decision already selected → **precision-only**. Precision is 7.8% of errors and stage-2 AUC is
+0.99996. Do not spend GPU time here until blocking recall moves.
+
+### E. France / address aliases — secondary, unsupervised OK
+
+India (labelled) already trails US by 0.015 on blocking recall; fix Indic blocking first. For
+France: mine street-type / region↔department aliases from **test-file co-occurrence** (allowed;
+no external gazetteer). Synthesis of French labels remains optional after India moves.
+
+### F. Stacking plan that can clear the +0.005 promotion gate
+
+| # | Lever | Status | Expected Δ (dev slice) |
+|---|---|---|---|
+| 1 | Union BM25 top-5 into `blocking.py` | measured ceiling +0.003; **not implemented** | +0.002–0.003 realized |
+| 2 | `--dense` (e5-small) | implemented, **never run** | recall ↑ (non-Latin) |
+| 3 | GT-mined Indic→English table into name keys | method validated above | recall ↑ (India) |
+| 4 | Adaptive `max_df` + split name/addr K budgets | not implemented | recall ↑ (df-cap misses) |
+| 5 | Meta-blocking CNP after expansions | not implemented | `pairs_per_s1` ↓ |
+| 6 | Group-size head + hard cap clip | not implemented | up to +0.006 |
+
+Items 1–4 are complementary recall plays; measure **together** on `--dev-frac 0.03`, then
+confirm at `0.3` before any full run.
 
 ## Reproduce
 

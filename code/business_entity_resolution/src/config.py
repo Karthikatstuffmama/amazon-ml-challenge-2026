@@ -27,7 +27,8 @@ class Config:
 
     # ---------------- blocking -------------
     k_key: int = 40                   # max key-based candidates per S1 record
-    k_dense: int = 15                 # extra candidates from the (optional) dense pass
+    k_dense: int = 15                 # dense neighbors kept for every record
+    k_dense_script: int = 50          # also keep non-Latin neighbors out to this rank
     name_topk: int = 2                # rarest name tokens used in keys
     addr_topk: int = 4                # rarest address tokens used in keys
     num_topk: int = 2                 # first N numbers of the address used in keys
@@ -35,11 +36,20 @@ class Config:
     max_df_name: int = 200            # stricter cap for name-only keys
     max_pairs_per_key: int = 50_000   # df_query * df_index cap (kills pathological keys)
     join_budget_rows: int = 40_000_000  # raw join rows per query chunk (RAM guard)
+    bm25_k: int = 5                   # union schema-agnostic BM25 top-k into candidates
+    # Also keep deeper BM25 hits when the INDEX address is empty. Residual blocking
+    # misses with empty addr have median BM25 rank ~33 (0% inside top-5).
+    bm25_k_empty: int = 40            # 0=off; keep empty-addr neighbors out to this rank
 
-    # ---------------- dense (optional GPU pass) ---------------
-    dense: bool = False
-    dense_model: str = "intfloat/multilingual-e5-small"   # MIT licence, 118M params
-    dense_batch: int = 512
+    # ---------------- dense -----------------------------------
+    # Measured winner on the 3% slice (0.991332): keys ∪ BM25@5 ∪ e5 kNN,
+    # with non-Latin neighbors kept out to rank 50.
+    dense: bool = True
+    # e5-small is the measured model (MIT, 118M, 384-d). Literature candidate, not yet
+    # scored here: ibm-granite/granite-embedding-97m-multilingual-r2 (Apache-2.0).
+    dense_model: str = "intfloat/multilingual-e5-small"
+    dense_batch: int = 256            # knee on M5 Air MPS; CUDA auto-ramps higher
+    dense_batch_fixed: bool = False   # True => skip the encode batch probe
     dense_max_len: int = 64
 
     # ---------------- features ------------
@@ -62,6 +72,9 @@ class Config:
 
     # ---------------- decision ------------
     decision: str = "auto"            # auto | threshold | expected_f
+    # Pre-adjust calibrated p using first house number before expected_f.
+    housenum_boost: float = 0.05      # add to p when first house numbers match exactly
+    housenum_pen: float = 0.05        # subtract when |Δ| in 1..5 (near-copy distractors)
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -73,6 +86,6 @@ class Config:
 
 
 # Settings that change the *meaning* of features; must be identical at train and test.
-FEATURE_CONTRACT = ("k_key", "k_dense", "name_topk", "addr_topk", "num_topk",
-                    "max_df_pair", "max_df_name", "max_pairs_per_key", "dense",
-                    "dense_model", "hash_features")
+FEATURE_CONTRACT = ("k_key", "k_dense", "k_dense_script", "name_topk", "addr_topk", "num_topk",
+                    "max_df_pair", "max_df_name", "max_pairs_per_key", "bm25_k", "bm25_k_empty",
+                    "dense", "dense_model", "hash_features")

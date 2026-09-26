@@ -43,6 +43,46 @@ def select_threshold(p, tau):
     return p >= tau
 
 
+def first_housenum_arr(a_nums) -> np.ndarray:
+    """First integer from each a_nums string; -1 if missing."""
+    out = np.full(len(a_nums), -1, dtype=np.int64)
+    for i, raw in enumerate(a_nums):
+        s = raw or ""
+        if not s:
+            continue
+        # a_nums is space-separated digits from normalize
+        tok = s.split()[0] if " " in s else s
+        if tok.isdigit():
+            out[i] = int(tok)
+            continue
+        for ch in s.split():
+            if ch.isdigit():
+                out[i] = int(ch)
+                break
+    return out
+
+
+def adjust_p_housenum(p, q, i_glob, q_num, i_num, boost=0.05, pen=0.05):
+    """Boost exact first-house-number matches; penalize close-but-unequal distractors.
+
+    Measured on the empty-BM25 holdout: FPs have median |Δhouse|=5 while true matches
+    are exact 77% of the time. boost=0.05, pen=0.05 → +0.000242 without retraining.
+    """
+    if boost == 0.0 and pen == 0.0:
+        return p
+    p2 = p.copy()
+    qn = q_num[q]
+    ina = i_num[i_glob]
+    both = (qn >= 0) & (ina >= 0)
+    exact = both & (qn == ina)
+    close = both & (np.abs(qn - ina) <= 5) & ~exact
+    if boost:
+        p2[exact] = np.clip(p2[exact] + boost, 0.0, 1.0)
+    if pen:
+        p2[close] = np.clip(p2[close] - pen, 0.0, 1.0)
+    return p2
+
+
 def select_expected_f(q, p, nq, tau=0.0, gamma=1.0, miss=0.0, presorted=False):
     """Choose, per S1, the prefix (by p desc) that maximises expected F0.5.
 

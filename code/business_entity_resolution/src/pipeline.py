@@ -65,6 +65,7 @@ def lgb_params(cfg, names, monotone_set):
              min_data_in_leaf=cfg.lgb_min_leaf, feature_fraction=0.8, bagging_fraction=0.75,
              bagging_freq=1, lambda_l1=0.3, lambda_l2=1.5, min_gain_to_split=0.01,
              max_bin=255, num_threads=os.cpu_count() or 4,
+             # Histogram GBDT, row-wise layout (wide-enough rows, few columns), all cores.
              seed=cfg.seed, deterministic=True, force_row_wise=True, verbose=-1,
              metric=["binary_logloss", "auc"])
     if cfg.monotone:
@@ -151,13 +152,16 @@ def _labels(cfg, ck, s1_rows, idx_rows, P, gt_keys, n_idx_total):
 def train_all(cfg: Config) -> dict:
     from blocking import load_pairs
     s1, idx, parts = load_split(cfg, "train", columns=["entity_id", "country", "ckey",
-                                                       "n_core", "a_full"])
+                                                       "n_core", "a_full", "a_nums"])
     n_s1, n_idx = len(s1), len(idx)
     fold_s1 = crc_fold(s1["entity_id"].tolist())
     gt_s1, gt_idx = load_gt(cfg)
     gt_keys = np.unique(gt_s1.astype(np.int64) * n_idx + gt_idx.astype(np.int64))
     G = np.bincount(gt_s1, minlength=n_s1).astype(np.float64)
     allowed = set(c.casefold() for c in cfg.train_countries) if cfg.train_countries else None
+    from decide import adjust_p_housenum, first_housenum_arr
+    q_hnum = first_housenum_arr(s1["a_nums"].to_numpy(dtype=object))
+    i_hnum = first_housenum_arr(idx["a_nums"].to_numpy(dtype=object))
 
     # ---------- per-partition metadata ----------
     meta = {}
@@ -278,6 +282,9 @@ def train_all(cfg: Config) -> dict:
     with open(os.path.join(model_dir(cfg), "calibrator.pkl"), "wb") as f:
         pickle.dump(iso, f)
     pc = iso.predict(p2).astype(np.float32)
+    pc = adjust_p_housenum(pc, q, ig, q_hnum, i_hnum,
+                           boost=float(getattr(cfg, "housenum_boost", 0.0) or 0.0),
+                           pen=float(getattr(cfg, "housenum_pen", 0.0) or 0.0))
 
     # ---------- decision tuning on OOF (folds 3-7), report on holdout (8-9) ----------
     q_tune = np.isin(fold_s1, cfg.stage2_folds)
@@ -285,6 +292,10 @@ def train_all(cfg: Config) -> dict:
     with timed("decision tuning"):
         best, _ = tune(q, ig, pc, y, G, q_tune, n_s1, cfg.decision)
         best1, _ = tune(q, ig, p1, y, G, q_tune, n_s1, "threshold")
+    # record housenum knobs so predict_test reapplies the same adjustment
+    best = dict(best)
+    best["housenum_boost"] = float(getattr(cfg, "housenum_boost", 0.0) or 0.0)
+    best["housenum_pen"] = float(getattr(cfg, "housenum_pen", 0.0) or 0.0)
     sel = apply_decision(q, ig, pc, n_s1, best)
     sel1 = apply_decision(q, ig, p1, n_s1, best1)
     ex = exclusive_mask(ig, pc)
@@ -340,8 +351,11 @@ def predict_test(cfg: Config):
     m1, m2 = load_models(cfg, "stage1"), load_models(cfg, "stage2")
     with open(os.path.join(model_dir(cfg), "calibrator.pkl"), "rb") as f:
         iso = pickle.load(f)
-    s1, idx, parts = load_split(cfg, "test", columns=["entity_id", "n_core", "a_full"])
+    s1, idx, parts = load_split(cfg, "test", columns=["entity_id", "n_core", "a_full", "a_nums"])
     n_s1 = len(s1)
+    from decide import adjust_p_housenum, first_housenum_arr
+    q_hnum = first_housenum_arr(s1["a_nums"].to_numpy(dtype=object))
+    i_hnum = first_housenum_arr(idx["a_nums"].to_numpy(dtype=object))
     idx_ncore_all = idx["n_core"].to_numpy(dtype=object)
     idx_afull_all = idx["a_full"].to_numpy(dtype=object)
     Q, I, PC = [], [], []
@@ -375,7 +389,13 @@ def predict_test(cfg: Config):
     q = np.concatenate(Q) if Q else np.zeros(0, np.int64)
     ig = np.concatenate(I) if I else np.zeros(0, np.int64)
     pc = np.concatenate(PC) if PC else np.zeros(0, np.float32)
-    sel = apply_decision(q, ig, pc, n_s1, meta["decision"])
+    dcfg = meta["decision"]
+    pc = adjust_p_housenum(
+        pc, q, ig, q_hnum, i_hnum,
+        boost=float(dcfg.get("housenum_boost", getattr(cfg, "housenum_boost", 0.0)) or 0.0),
+        pen=float(dcfg.get("housenum_pen", getattr(cfg, "housenum_pen", 0.0)) or 0.0),
+    )
+    sel = apply_decision(q, ig, pc, n_s1, dcfg)
     LOG.info("test: %d candidate pairs, %d selected, %.1f%% S1 with >=1 match",
              len(q), int(sel.sum()), 100 * len(np.unique(q[sel])) / max(1, n_s1))
 

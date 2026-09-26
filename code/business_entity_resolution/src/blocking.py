@@ -15,6 +15,7 @@ sort + searchsorted (no Python loops over records, no string keys, no hash maps)
   NH  name token x house number
   NP  name token pair                 (name only; handles missing/foreign address)
   NC  concatenated core name          (domains 'sjdcement.com', spacing variants)
+  BM25 (optional) schema-agnostic top-k over name+address+name-4grams (union only)
   DENSE (optional) multilingual embedding kNN on GPU
 
 Keys are packed as uint64: [type:8][a:28][b:28]. Tokens are factorised per family,
@@ -25,18 +26,23 @@ exact number of join rows so peak RAM is predictable.
 from __future__ import annotations
 
 import os
+import re
+from collections import defaultdict
 
 import numpy as np
 import pandas as pd
+import scipy.sparse as sp
 
 from utils import LOG, popcount16, rank_in_sorted_groups, safe_name, timed
 
-T_NT, T_NS, T_AN, T_NH, T_NP, T_NC, T_PH, T_DENSE = 0, 1, 2, 3, 4, 5, 6, 7
+T_NT, T_NS, T_AN, T_NH, T_NP, T_NC, T_PH, T_DENSE, T_BM25 = 0, 1, 2, 3, 4, 5, 6, 7, 8
 TYPE_NAMES = {T_NT: "NT", T_NS: "NS", T_AN: "AN", T_NH: "NH", T_NP: "NP", T_NC: "NC",
-              T_PH: "PH", T_DENSE: "DENSE"}
+              T_PH: "PH", T_DENSE: "DENSE", T_BM25: "BM25"}
 _S56 = np.uint64(56)
 _S28 = np.uint64(28)
 _M28 = (1 << 28) - 1
+
+_TOK = re.compile(r"[^\W_]+", re.UNICODE)
 
 
 # --------------------------------------------------------------------------- #
@@ -266,8 +272,8 @@ def block_partition(Q, I, cfg):
                 brank=np.concatenate(out_r))
 
 
-def merge_dense(P: dict, dq, di, dsim, k_key: int):
-    """Union key candidates with dense kNN candidates (bit 7). Keeps q-sorted order."""
+def merge_extra(P: dict, dq, di, dsim, k_key: int, bit: int, sim_key: str | None = "dcos"):
+    """Union key candidates with an extra retrieval list (dense / BM25). Keeps q-sorted order."""
     kq = P["q"].astype(np.int64)
     ki = P["i"].astype(np.int64)
     kp = (kq << 32) | ki
@@ -279,17 +285,152 @@ def merge_dense(P: dict, dq, di, dsim, k_key: int):
     bits = np.zeros(n, np.uint16)
     brank = np.full(n, k_key + 50, np.int16)
     dcos = np.full(n, np.nan, np.float32)
+    if "dcos" in P:
+        dcos_old = P["dcos"]
+    else:
+        dcos_old = np.full(len(P["q"]), np.nan, np.float32)
     ik, idn = inv[:len(kp)], inv[len(kp):]
     bscore[ik] = P["bscore"]
     bits[ik] = P["bits"]
     brank[ik] = P["brank"]
-    bits[idn] |= np.uint16(1 << T_DENSE)
-    dcos[idn] = dsim
+    dcos[ik] = dcos_old
+    bits[idn] |= np.uint16(1 << bit)
+    if sim_key == "dcos":
+        dcos[idn] = dsim
     return dict(q=(u >> 32).astype(np.int32), i=(u & 0xFFFFFFFF).astype(np.int32),
                 bscore=bscore, bits=bits, brank=brank, dcos=dcos)
 
 
+def _nonlatin_mask(names) -> np.ndarray:
+    """True when the string has no Latin letter (Devanagari, Kannada, and the rest)."""
+    out = np.zeros(len(names), dtype=bool)
+    for i, raw in enumerate(names):
+        s = raw or ""
+        if any(ord(c) > 127 for c in s) and not any("A" <= c <= "Z" or "a" <= c <= "z" for c in s):
+            out[i] = True
+    return out
+
+
+def _script_keep(dq, di, ds, q_names, i_names, k_dense: int, k_script: int):
+    """Keep the usual dense top-k, plus deeper neighbors when either name is non-Latin.
+
+    Measured on the stack holdout: residual blocking misses in a non-Latin name have
+    median dense rank 29, and 66% sit inside rank 50, while k_dense=15 keeps none of them.
+    """
+    if k_script <= k_dense or len(dq) == 0:
+        return dq, di, ds
+    order = np.lexsort((-ds, dq))
+    dq, di, ds = dq[order], di[order], ds[order]
+    rk = rank_in_sorted_groups(dq)
+    q_nat = _nonlatin_mask(q_names)
+    i_nat = _nonlatin_mask(i_names)
+    keep = (rk < k_dense) | ((rk < k_script) & (q_nat[dq] | i_nat[di]))
+    return dq[keep], di[keep], ds[keep]
+
+
+def _bm25_empty_keep(bq, bi, bs, i_addrs, k_bm25: int, k_empty: int):
+    """Keep the usual BM25 top-k, plus deeper hits when the index address is empty.
+
+    On the script-stack holdout, residual empty-address blocking misses have median
+    BM25 rank 33 and ~55% sit inside rank 50; bm25_k=5 keeps none of them.
+    """
+    if k_empty <= k_bm25 or len(bq) == 0:
+        return bq, bi, bs
+    order = np.lexsort((-bs, bq))
+    bq, bi, bs = bq[order], bi[order], bs[order]
+    rk = rank_in_sorted_groups(bq)
+    empty = np.fromiter((not (a or "").strip() for a in i_addrs), bool, len(i_addrs))
+    keep = (rk < k_bm25) | ((rk < k_empty) & empty[bi])
+    return bq[keep], bi[keep], bs[keep]
+
+
+def merge_dense(P: dict, dq, di, dsim, k_key: int):
+    """Union key candidates with dense kNN candidates (bit 7)."""
+    return merge_extra(P, dq, di, dsim, k_key, T_DENSE, sim_key="dcos")
+
+
+def _bm25_tokenize(name: str, addr: str) -> list[str]:
+    n = (name or "").lower()
+    a = (addr or "").lower()
+    out = [f"n:{t}" for t in _TOK.findall(n)] + [f"a:{t}" for t in _TOK.findall(a)]
+    squash = re.sub(r"[^0-9a-z\u0900-\u097f]", "", n)
+    out += [f"g:{squash[i:i + 4]}" for i in range(0, max(0, len(squash) - 3))]
+    return out
+
+
+def bm25_topk(q_names, q_addrs, i_names, i_addrs, k: int, chunk: int = 0,
+              max_df_ratio: float = 0.20):
+    """Schema-agnostic BM25 top-k. Returns local (q_idx, i_idx, score) arrays.
+
+    Scores match the k1=1.2, b=0.75 formula exactly. `chunk` only changes how many
+    queries share one BLAS gemm (0 = pick the largest chunk that stays under ~1.2 GB).
+    """
+    nq, ni = len(q_names), len(i_names)
+    k = int(min(k, ni))
+    if nq == 0 or k == 0:
+        return (np.zeros(0, np.int32), np.zeros(0, np.int32), np.zeros(0, np.float32))
+    docs = [_bm25_tokenize(n, a) for n, a in zip(i_names, i_addrs)]
+    vocab: dict[str, int] = {}
+    rows, cols, tfs = [], [], []
+    for i, toks in enumerate(docs):
+        c = defaultdict(int)
+        for t in toks:
+            c[t] += 1
+        for t, f in c.items():
+            j = vocab.setdefault(t, len(vocab))
+            rows.append(i); cols.append(j); tfs.append(f)
+    n_vocab = len(vocab)
+    tf = sp.csr_matrix((np.asarray(tfs, np.float32), (rows, cols)), shape=(ni, n_vocab))
+    df = np.asarray((tf > 0).sum(axis=0)).ravel()
+    dl = np.asarray(tf.sum(axis=1)).ravel()
+    avgdl = max(1e-9, float(dl.mean()))
+    k1, b = 1.2, 0.75
+    idf = np.log(1.0 + (ni - df + 0.5) / (df + 0.5)).astype(np.float32)
+    # Floor the df cap so tiny partitions (smoke / tiny countries) are not wiped.
+    idf = np.where(df <= max(50, int(max_df_ratio * ni)), idf, 0.0).astype(np.float32)
+    tf = tf.tocoo()
+    denom = tf.data + k1 * (1.0 - b + b * dl[tf.row] / avgdl)
+    w = idf[tf.col] * tf.data * (k1 + 1.0) / denom
+    D = sp.csr_matrix((w.astype(np.float32), (tf.row, tf.col)), shape=(ni, n_vocab))
+    D.eliminate_zeros()
+    Dt = D.T.tocsr()
+
+    qrows, qcols, qvals = [], [], []
+    for qi, (n, a) in enumerate(zip(q_names, q_addrs)):
+        for t in set(_bm25_tokenize(n, a)):
+            j = vocab.get(t)
+            if j is not None and idf[j] > 0:
+                qrows.append(qi); qcols.append(j); qvals.append(1.0)
+    Q = sp.csr_matrix((np.asarray(qvals, np.float32), (qrows, qcols)), shape=(nq, n_vocab))
+
+    # 400 was faster than ~1.2 GB chunks on a 16 GB Mac (those paged and ran slower).
+    if chunk <= 0:
+        chunk = min(400, nq)
+    out_q, out_i, out_s = [], [], []
+    with timed(f"bm25:topk nq={nq:,} ni={ni:,} k={k} chunk={chunk}"):
+        for s0 in range(0, nq, chunk):
+            S = (Q[s0:s0 + chunk] @ Dt).toarray()
+            if S.size == 0:
+                continue
+            kk = min(k, S.shape[1])
+            part = np.argpartition(-S, kk - 1, axis=1)[:, :kk]
+            rowsc = np.arange(S.shape[0])[:, None]
+            ordr = np.argsort(-S[rowsc, part], axis=1)
+            top = part[rowsc, ordr]
+            sc = S[rowsc, top]
+            rr, cc = np.nonzero(sc > 0)
+            if len(rr) == 0:
+                continue
+            out_q.append((s0 + rr).astype(np.int32))
+            out_i.append(top[rr, cc].astype(np.int32))
+            out_s.append(sc[rr, cc].astype(np.float32))
+    if not out_q:
+        return (np.zeros(0, np.int32), np.zeros(0, np.int32), np.zeros(0, np.float32))
+    return np.concatenate(out_q), np.concatenate(out_i), np.concatenate(out_s)
+
+
 BLOCK_COLS = ["n_core", "n_skel", "n_phon", "n_concat", "a_alpha", "a_skel", "a_nums"]
+_TEXT_COLS = ["business_name", "business_address"]
 
 
 def run_blocking(cfg, split: str, s1, idx, parts, emb=None) -> dict:
@@ -297,6 +438,7 @@ def run_blocking(cfg, split: str, s1, idx, parts, emb=None) -> dict:
     from prepare import split_dir
     d = split_dir(cfg, split)
     stats = {}
+    use_bm25 = int(getattr(cfg, "bm25_k", 0) or 0) > 0
     for ck, (s1_rows, idx_rows) in parts.items():
         path = os.path.join(d, f"pairs_{safe_name(ck)}.npz")
         if os.path.exists(path) and not cfg.force:
@@ -304,16 +446,48 @@ def run_blocking(cfg, split: str, s1, idx, parts, emb=None) -> dict:
             stats[ck] = dict(n_s1=len(s1_rows), n_idx=len(idx_rows), pairs=len(z["q"]))
             continue
         with timed(f"block:{split}:{ck!r} S1={len(s1_rows):,} IDX={len(idx_rows):,}"):
-            Q = s1.iloc[s1_rows][BLOCK_COLS].reset_index(drop=True)
-            I = idx.iloc[idx_rows][BLOCK_COLS].reset_index(drop=True)
-            P = block_partition(Q, I, cfg)
+            cols = BLOCK_COLS + (_TEXT_COLS if use_bm25 else [])
+            Q = s1.iloc[s1_rows][cols].reset_index(drop=True)
+            I = idx.iloc[idx_rows][cols].reset_index(drop=True)
+            P = block_partition(Q[BLOCK_COLS], I[BLOCK_COLS], cfg)
+            P["dcos"] = np.full(len(P["q"]), np.nan, np.float32)
+            if use_bm25 and len(s1_rows) and len(idx_rows):
+                k_empty = int(getattr(cfg, "bm25_k_empty", 0) or 0)
+                k_take = max(int(cfg.bm25_k), k_empty)
+                i_addrs = I["business_address"].to_numpy(object)
+                bq, bi, bs = bm25_topk(
+                    Q["business_name"].to_numpy(object),
+                    Q["business_address"].to_numpy(object),
+                    I["business_name"].to_numpy(object),
+                    i_addrs,
+                    k_take,
+                )
+                n_before = len(bq)
+                if k_empty > int(cfg.bm25_k):
+                    bq, bi, bs = _bm25_empty_keep(
+                        bq, bi, bs, i_addrs, int(cfg.bm25_k), k_empty)
+                    LOG.info("  %r BM25 empty-keep: %d -> %d", ck, n_before, len(bq))
+                P = merge_extra(P, bq, bi, bs, cfg.k_key, T_BM25, sim_key=None)
+                LOG.info("  %r BM25 union: +%d raw hits -> %d pairs",
+                         ck, len(bq), len(P["q"]))
             if emb is not None and len(s1_rows) and len(idx_rows):
                 from dense import knn_topk
                 eq, ei = emb
-                dq, di, ds = knn_topk(eq, ei, s1_rows, idx_rows, cfg.k_dense)
+                k_script = int(getattr(cfg, "k_dense_script", 0) or 0)
+                k_take = max(cfg.k_dense, k_script)
+                dq, di, ds = knn_topk(eq, ei, s1_rows, idx_rows, k_take)
+                if k_script > cfg.k_dense:
+                    # names are needed even when BM25 is off
+                    if "business_name" not in Q.columns:
+                        Qn = s1.iloc[s1_rows]["business_name"].to_numpy(object)
+                        In = idx.iloc[idx_rows]["business_name"].to_numpy(object)
+                    else:
+                        Qn = Q["business_name"].to_numpy(object)
+                        In = I["business_name"].to_numpy(object)
+                    n_before = len(dq)
+                    dq, di, ds = _script_keep(dq, di, ds, Qn, In, cfg.k_dense, k_script)
+                    LOG.info("  %r dense script-keep: %d -> %d", ck, n_before, len(dq))
                 P = merge_dense(P, dq, di, ds, cfg.k_key)
-            else:
-                P["dcos"] = np.full(len(P["q"]), np.nan, np.float32)
             np.savez(path, **P)
             stats[ck] = dict(n_s1=len(s1_rows), n_idx=len(idx_rows), pairs=len(P["q"]))
             LOG.info("  %r: %d pairs (%.1f / S1)", ck, len(P["q"]),

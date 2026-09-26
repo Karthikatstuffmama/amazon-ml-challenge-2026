@@ -21,7 +21,7 @@ from rapidfuzz import distance, fuzz, process
 from sklearn.feature_extraction.text import HashingVectorizer
 from sklearn.preprocessing import normalize as sk_normalize
 
-from blocking import T_AN, T_DENSE, T_NC, T_NH, T_NP, T_NS, T_NT, T_PH
+from blocking import T_AN, T_BM25, T_DENSE, T_NC, T_NH, T_NP, T_NS, T_NT, T_PH
 from utils import LOG, group_max, group_rank_desc, popcount16, safe_name, timed
 
 BASE_FEATURES = [
@@ -36,7 +36,8 @@ BASE_FEATURES = [
     "a_num_conflict", "a_state_eq", "a_len_i", "a_ncomp_i", "i_addr_translit",
     # blocking / structure
     "src_s3", "bscore", "brank", "b_ntypes", "bit_nt", "bit_ns", "bit_ph", "bit_an",
-    "bit_nh", "bit_np", "bit_nc", "bit_dense", "dense_cos", "emb_cos", "n_phon_ratio",
+    "bit_nh", "bit_np", "bit_nc", "bit_bm25", "bit_dense", "dense_cos", "emb_cos",
+    "n_phon_ratio",
     # frequency / ambiguity
     "q_name_df_s1", "i_name_df_idx", "i_name_df_s1",
 ]
@@ -272,7 +273,7 @@ class PartitionFeaturizer:
         put("b_ntypes", popcount16(bits))
         for name, t in (("bit_nt", T_NT), ("bit_ns", T_NS), ("bit_ph", T_PH), ("bit_an", T_AN),
                         ("bit_nh", T_NH), ("bit_np", T_NP), ("bit_nc", T_NC),
-                        ("bit_dense", T_DENSE)):
+                        ("bit_bm25", T_BM25), ("bit_dense", T_DENSE)):
             put(name, ((bits >> t) & 1).astype(np.float32))
         put("dense_cos", P["dcos"][sl])
         if self.emb_q is not None and emb_rows is not None:

@@ -5,23 +5,24 @@ blockchain. Scored with **F₀.₅** (precision-weighted 2×), macro-averaged pe
 
 | | |
 |---|---|
-| Leaderboard score | **0.945193** |
-| Top-10 cut | **0.986** |
-| Measured ceiling | **~0.999** |
-| Dev-slice baseline | 0.983787 (`--dev-frac 0.03`, optimistic) |
+| Public LB (archived baseline) | 0.945193 |
+| Expected full-run (shipped defaults) | **~0.98** (dev-slice 0.991732 @ 3%) |
+| Top-10 cut | 0.986 |
+| Measured ceiling | ~0.999 |
+
+Shipped defaults (already on): dense e5 ∪ BM25-k5 ∪ empty-addr BM25-k40 ∪ script neighbors
+∪ housenum p-adjust. See `EXPERIMENTS.md` for every measured keep/revert.
 
 ## Start here
 
 | Doc | Contents |
 |---|---|
-| **`AGENTS.md`** | **Read first.** Working rules, the promotion gate for full runs, known dead ends, setup, and the measurement loop. |
-| **`EXPERIMENTS.md`** | **The log.** Every change, its measured delta, and the verdict. Append to it every time. |
-| **`FINDINGS.md`** | Ground-truth evidence: verified transformations, the real error taxonomy, per-country scores. Supersedes other docs where they conflict. |
-| **`LITERATURE.md`** | Published ER techniques **tested on our data** — which transferred, which did not, and why. |
-| `code/business_entity_resolution/README.md` | How to run and reproduce the pipeline |
-| `research.md` · `strategy.md` · `PLAN.md` | Dataset facts, approach, phased plan |
-| `HARDWARE.md` | RTX 5080 laptop runbook (CUDA 12.8, disk/RAM/VRAM budgets) |
-| `student_resource/README.md` | The official problem statement |
+| **`AGENTS.md`** | **Read first.** Working rules, promotion gate, known dead ends, measurement loop. |
+| **`EXPERIMENTS.md`** | **The log.** Every change, delta, verdict. Append every time. |
+| **`FINDINGS.md`** | Ground-truth evidence + error taxonomy. Supersedes other docs on conflicts. |
+| **`code/business_entity_resolution/README.md`** | **How to install, run, and tune batches for RAM** (crash avoidance). |
+| `LITERATURE.md` · `HARDWARE.md` | What transferred; GPU/disk budgets |
+| `student_resource/README.md` | Official problem statement |
 
 ## Two non-negotiable process rules
 
@@ -31,67 +32,45 @@ blockchain. Scored with **F₀.₅** (precision-weighted 2×), macro-averaged pe
    `--dev-frac 0.03`, still positive at `--dev-frac 0.3`, pending gains total **≥ +0.005**, and
    you can state the mechanism in one sentence.
 
-## Where the score actually leaks
-
-Measured on the real pipeline against real ground truth — 13,378 holdout entities, 1,882 errors:
-
-| Category | Share |
-|---|---|
-| **blocking_miss** — true match never became a candidate | **63.1%** |
-| **missed_in_candidates** — was a candidate, not selected | **29.1%** |
-| fp_distractor / fp_stolen / fp_on_singleton | 7.8% combined |
-
-**92.2% of errors are false negatives.** Despite F₀.₅ being precision-weighted, precision is not
-where the work is: stage-2 AUC is 0.99996, so the decision rule is already conservative enough
-that almost nothing over-merges. And the misses are **recoverable** — 99.92% of missed pairs
-share at least one token with their S1 record; top-K and the `max_df` caps discarded them.
-
-Per-country (both fully labelled): **US 0.9896, India 0.9749** — India's gap is blocking recall
-(95.70% vs 98.57%), concentrated in Devanagari names. France has **no labels anywhere** (it
-exists only in the unlabelled test set), so it can never be scored directly; India is the proxy.
-
-**Act in this order:** (1) `run.py all --dense` — it was off and targets the 37% non-Latin
-misses; (2) mined Devanagari→English token table, adaptive `max_df`, split K budgets;
-(3) per-entity group-size prediction; (4) precision last.
-
-## Proven structural facts
-
-Exact, across all 2,083,574 entities and 7,638,365 matched records:
-
-- **One-owner holds** — every S2/S3 record belongs to at most one S1. Zero violations.
-- **Caps hold** — n_S2 ≤ 5, n_S3 ≤ 6. Zero violations.
-- Every S1 entity is unique by normalized name + address (zero collisions), so nothing is
-  fundamentally unresolvable.
-
-Supporting: singletons 5.585%, mean 3.461 matches, ~27% distractor records, and the dataset is a
-**synthetic generator with a finite rule set** — so alias tables should be mined from ground
-truth, never hand-written.
-
-## Known dead ends (measured — don't repeat)
-
-| Idea | Result |
-|---|---|
-| Better global threshold | best single τ is **worse** than the shipped rule (−0.000274) |
-| Per-country thresholds | −0.000083, no gain |
-| Segment-specific cuts | model already well calibrated there |
-| Hand-tuned similarity rules instead of the GBM | AUC is 0.99996; rules lose |
-| Phone/domain feature | **there is no phone field** — only name, address, country |
-| **BM25 top-k as a blocking replacement** (Sparkly, PVLDB'23) | **much worse: 94.29% @k=40 vs 97.42% @21.** Union it instead — see `LITERATURE.md` |
-
-`oracle_topk` 0.990587 vs `oracle_subset` 0.990727 ⇒ ranking is effectively solved. The
-remaining ≈0.0065 is entirely **per-entity k selection**.
-
-## Quick start
+## Quick start (Mac / Linux)
 
 ```bash
 cd code/business_entity_resolution
+
+# 1. Env (skip if .venv already works)
+# uv venv .venv -p 3.11
+# uv pip install --python .venv/bin/python -r requirements.txt
+# uv pip install --python .venv/bin/python -r requirements-dense.txt   # needed: dense is ON by default
+
 .venv/bin/python tests/smoke_test.py          # must print SMOKE TEST PASS
 
+# 2. Dev slice (~3–8 min with dense on Apple Silicon)
 DS=../../student_resource/dataset
-.venv/bin/python src/run.py train --data-dir $DS --work-dir work_dev \
-    --dev-frac 0.03 --keep-intermediates      # ~3 min
-cat work_dev/models/report.json
-.venv/bin/python src/error_analysis.py --work-dir work_dev
+.venv/bin/python -u src/run.py train --data-dir $DS --work-dir work_dev \
+    --dev-frac 0.03 --keep-intermediates --dense-batch 256
+
+cat work_dev/models/report.json               # trust deltas, not absolutes
+```
+
+**Full train+predict** (only after the `AGENTS.md` promotion gate):
+
+```bash
+.venv/bin/python -u src/run.py all --data-dir $DS --work-dir work_full \
+    --out-dir ../../output --dense-batch 256
+```
+
+On a CUDA box with ≥24 GB VRAM use `--dense-batch 1024`. Details and OOM recovery live in
+[`code/business_entity_resolution/README.md`](code/business_entity_resolution/README.md)
+§ "RAM / batch sizes".
+
+## Caches — do not commit
+
+All `work/`, `work_*`, `work_exp_*`, `*.npy`, `*.parquet` under the pipeline are gitignored.
+They are multi-GB memmaps. Delete unused ones anytime:
+
+```bash
+rm -rf code/business_entity_resolution/work_*
+# keep regenerating with a fresh --work-dir name per experiment
 ```
 
 ## Before every submission
@@ -105,22 +84,41 @@ python3 student_resource/utils/validate_submission.py \
 
 Must print `PASS`. A rejected upload costs a submission slot.
 
+## Where the score leaks (measured)
+
+| Category | Share |
+|---|---|
+| **blocking_miss** | **63.1%** |
+| **missed_in_candidates** | **29.1%** |
+| FP categories combined | 7.8% |
+
+**92.2% of errors are false negatives.** Stage-2 AUC is 0.99996 — precision is not the work.
+US 0.9896 / India 0.9749 (India = blocking recall). France has **no labels** anywhere.
+
+## Known dead ends (do not repeat)
+
+| Idea | Result |
+|---|---|
+| Better global / per-country τ | flat or worse |
+| BM25 as blocking *replacement* | much worse; **union only** |
+| Domain/acronym near-copy feature | −0.000617 → reverted |
+| Group-size / reranker / name force-include | no keep on slice |
+| Phone feature | **no phone field** |
+
 ## Hard constraints
 
-- **No external data lookup** — no ER APIs, registries, geocoding, or internet augmentation.
-  Only the provided files. Top teams are audited; violation means disqualification.
-- Final model **MIT/Apache-2.0, ≤ 8B parameters** (LightGBM MIT; e5-small MIT, 118M).
-- Decide on the holdout, not the public leaderboard — the private split sets the rank.
+- **No external data lookup** — no ER APIs, registries, geocoding, internet augmentation.
+- Final model **MIT/Apache-2.0, ≤ 8B** (LightGBM MIT; e5-small MIT, 118M).
+- Decide on the holdout, not the public LB.
 
 ## Layout
 
 ```
-├── AGENTS.md  EXPERIMENTS.md  FINDINGS.md        process + evidence
+├── AGENTS.md  EXPERIMENTS.md  FINDINGS.md
 ├── README.md  research.md  strategy.md  PLAN.md  HARDWARE.md
-├── code/business_entity_resolution/   the pipeline (required submission layout)
-│   ├── src/  tests/  .venv/  work_dev/  requirements*.txt  package_submission.py
-├── student_resource/     given data, official validator, Documentation_template.md
-├── baseline/output_0.945193/   the scored 0.945 submission, archived
-├── output/               live submission artifacts
-└── work/                 analysis scratch
+├── code/business_entity_resolution/   the pipeline (submission layout)
+├── student_resource/                  given data + official validator
+├── baseline/output_0.945193/          archived scored submission
+├── output/                            live submission artifacts
+└── work/                              small analysis scratch (not pipeline cache)
 ```
