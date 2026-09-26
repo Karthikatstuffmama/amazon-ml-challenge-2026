@@ -7,6 +7,7 @@ L2-normalised fp16 memmaps (N x 384 x 2 bytes) cached on disk.
 
 Encode path: hash unique `name|addr` strings, embed once, scatter back (big win when
 duplicates are common). Crash-safe: resumes from `emb_*.npy.tmp` + `.progress`.
+Multi-GPU CUDA: one SentenceTransformer per device, unique texts sharded in waves.
 
 kNN: FAISS IndexFlatIP when available (exact cosine on L2-normalised vectors), else
 chunked torch gemm. Same top-k semantics either way.
@@ -42,10 +43,27 @@ def _pick_device():
     return "cpu", False
 
 
+def _cuda_device_count() -> int:
+    import torch
+    if not torch.cuda.is_available():
+        return 0
+    return int(torch.cuda.device_count())
+
+
 def _texts(df):
     n = df["business_name"].astype(str).tolist()
     a = df["business_address"].astype(str).tolist()
     return [f"query: {x} | {y}" for x, y in zip(n, a)]
+
+
+def _load_st_model(cfg, device: str, use_fp16: bool):
+    from sentence_transformers import SentenceTransformer
+    model = SentenceTransformer(cfg.dense_model, device=device)
+    model.max_seq_length = cfg.dense_max_len
+    model.eval()
+    if use_fp16 and device.startswith("cuda"):
+        model.half()
+    return model
 
 
 def _best_batch(model, texts_probe, candidates, dev: str) -> int:
@@ -75,6 +93,54 @@ def _best_batch(model, texts_probe, candidates, dev: str) -> int:
             LOG.info("    batch-tune %d failed (%s); stopping ramp", b, type(e).__name__)
             break
     return best_b
+
+
+def _encode_unique_parallel(models, uniq, mm_u, resume_from, nu, batch, step, prog,
+                            t_start, *, is_mps: bool = False):
+    """Encode uniq[resume_from:nu] into mm_u using one SentenceTransformer per device."""
+    import torch
+    from concurrent.futures import ThreadPoolExecutor
+
+    ngpu = len(models)
+
+    def _encode_range(model, s0: int, s1: int):
+        with torch.inference_mode():
+            e = model.encode(
+                uniq[s0:s1],
+                batch_size=batch,
+                normalize_embeddings=True,
+                convert_to_numpy=True,
+                show_progress_bar=False,
+            )
+        return s0, e
+
+    wave = step * ngpu
+    for wave_i, s in enumerate(range(resume_from, nu, wave)):
+        jobs = []
+        for g in range(ngpu):
+            s0 = s + g * step
+            if s0 >= nu:
+                break
+            s1 = min(nu, s0 + step)
+            jobs.append((g, s0, s1))
+
+        if ngpu == 1:
+            results = [_encode_range(models[0], jobs[0][1], jobs[0][2])]
+        else:
+            with ThreadPoolExecutor(max_workers=ngpu) as pool:
+                futs = [pool.submit(_encode_range, models[g], s0, s1) for g, s0, s1 in jobs]
+                results = [f.result() for f in futs]
+
+        for s0, e in results:
+            mm_u[s0:s0 + len(e)] = e.astype(np.float16)
+        done = min(nu, s + wave)
+        _save_progress(prog, done)
+        elapsed = max(1e-6, time.perf_counter() - t_start)
+        session = done - resume_from
+        LOG.info("    unique-encoded %d / %d (%.0f%%)  %.0f uniq/s  (ngpu=%d)",
+                 done, nu, 100.0 * done / nu, session / elapsed, ngpu)
+        if is_mps and (wave_i + 1) % 8 == 0:
+            torch.mps.empty_cache()
 
 
 def build_embeddings(cfg, split: str, s1, idx):
@@ -127,11 +193,10 @@ def _save_progress(prog: str, done: int) -> None:
 def _encode_to(path, texts, cfg):
     """Encode corpus → fp16 memmap with unique-text dedup + crash resume.
 
-    Stages stay sequential (S1 then idx; countries later). Inside each chunk the
-    accelerator parallelises the matmul — that is the safe parallelism on 16 GB.
+    On multi-GPU CUDA boxes (e.g. Kaggle T4×2), unique texts are sharded across
+    devices with one SentenceTransformer per GPU. Single-GPU / MPS / CPU unchanged.
     """
     import torch
-    from sentence_transformers import SentenceTransformer
 
     ncpu = max(1, (os.cpu_count() or 4) - 1)
     torch.set_num_threads(ncpu)
@@ -146,11 +211,16 @@ def _encode_to(path, texts, cfg):
              n, nu, 100.0 * nu / max(1, n))
 
     dev, use_fp16 = _pick_device()
-    model = SentenceTransformer(cfg.dense_model, device=dev)
-    model.max_seq_length = cfg.dense_max_len
-    model.eval()
-    if use_fp16 and dev == "cuda":
-        model.half()
+    ngpu = _cuda_device_count() if dev == "cuda" else 1
+    ngpu = max(1, ngpu)
+    if dev == "cuda" and ngpu > 1:
+        LOG.info("    multi-GPU encode: %d CUDA devices", ngpu)
+        devices = [f"cuda:{g}" for g in range(ngpu)]
+    else:
+        devices = [dev]
+
+    models = [_load_st_model(cfg, d, use_fp16) for d in devices]
+    model0 = models[0]
 
     base = int(cfg.dense_batch)
     if dev == "cuda":
@@ -164,13 +234,13 @@ def _encode_to(path, texts, cfg):
 
     if getattr(cfg, "dense_batch_fixed", False):
         batch = int(cfg.dense_batch)
-        LOG.info("    pinned encode batch=%d on %s (probe skipped)", batch, dev)
+        LOG.info("    pinned encode batch=%d on %s (probe skipped)", batch, devices)
     else:
         probe_n = min(nu, max(cands) * 2, 8192 if dev == "cuda" else 2048)
-        batch = _best_batch(model, uniq[:probe_n], cands, dev) if nu >= 256 else cands[0]
-        LOG.info("    selected encode batch=%d on %s", batch, dev)
+        batch = _best_batch(model0, uniq[:probe_n], cands, dev) if nu >= 256 else cands[0]
+        LOG.info("    selected encode batch=%d on %s", batch, devices)
 
-    dim = model.get_sentence_embedding_dimension()
+    dim = model0.get_sentence_embedding_dimension()
     tmp_u = path + ".uniq.tmp.npy"
     prog = _progress_path(tmp_u)
     # Fingerprint so a resumed file matches this unique set.
@@ -194,26 +264,11 @@ def _encode_to(path, texts, cfg):
     step = max(batch * (32 if dev == "cuda" else 16), 8192)
     t_start = time.perf_counter()
     with timed(f"dense:encode-unique {os.path.basename(path)} uniq={nu:,}/{n:,} "
-               f"on {dev} batch={batch}"):
-        with torch.inference_mode():
-            for i, s in enumerate(range(resume_from, nu, step)):
-                e = model.encode(
-                    uniq[s:s + step],
-                    batch_size=batch,
-                    normalize_embeddings=True,
-                    convert_to_numpy=True,
-                    show_progress_bar=False,
-                )
-                mm_u[s:s + len(e)] = e.astype(np.float16)
-                done = s + len(e)
-                _save_progress(prog, done)
-                elapsed = max(1e-6, time.perf_counter() - t_start)
-                # rate over this session only (resume-friendly)
-                session = done - resume_from
-                LOG.info("    unique-encoded %d / %d (%.0f%%)  %.0f uniq/s",
-                         done, nu, 100.0 * done / nu, session / elapsed)
-                if dev == "mps" and (i + 1) % 8 == 0:
-                    torch.mps.empty_cache()
+               f"on {devices} batch={batch}"):
+        _encode_unique_parallel(
+            models, uniq, mm_u, resume_from, nu, batch, step, prog, t_start,
+            is_mps=(dev == "mps"),
+        )
     mm_u.flush()
 
     # Scatter unique → full row memmap.

@@ -322,3 +322,10 @@ Targets: **0.986** = top 10. **~0.999** = measured ceiling.
 - **Already true (no change):** stage caches, mmap features, pair dedup in `merge_extra`, fuzzy gate@24, fold crc, max_train_rows=30M, script/empty BM25 adaptive.
 - **Command:** `tests/smoke_test.py` → **PASS**. Adaptive / hard-neg full-slice measure: **pending** (`--dense-adaptive` on `--dev-frac 0.03` before promote).
 - **Verdict:** **KEEP plumbing.** Do not enable `--dense-adaptive` on A100 until 3% then 0.3 measure. Entity-level k selection stays off.
+
+### 2026-09-26 — Multi-GPU E5 encode (T4×2) — KEEP plumbing, score N/A
+- **Hypothesis:** Kaggle T4×2 can nearly double unique-text encode throughput by sharding across devices; overall wall clock only partially improves (features/LGB stay CPU).
+- **Change:** `dense.py` loads one `SentenceTransformer` per CUDA device and encodes unique-text waves in parallel (`ThreadPoolExecutor`); single-GPU / MPS / CPU path unchanged. Crash-resume progress still advances contiguously per wave.
+- **Command:** not measured on a holdout slice yet (live full Kaggle run already in flight on 1×T4 — do not interrupt).
+- **Before → After:** score **N/A** (encode-only speed). Expect log line `multi-GPU encode: 2 CUDA devices` + `ngpu=2` on next encode.
+- **Verdict:** **KEEP.** Applies automatically when `torch.cuda.device_count() > 1`.
