@@ -328,6 +328,36 @@ def _script_keep(dq, di, ds, q_names, i_names, k_dense: int, k_script: int):
     return dq[keep], di[keep], ds[keep]
 
 
+def _adaptive_dense_keep(dq, di, ds, q_names, i_names, q_addrs, i_addrs,
+                         k_easy: int, k_dense: int, k_empty: int, k_script: int):
+    """Per-query dense budget: easy→k_easy, empty-addr→k_empty, non-Latin→k_script, else k_dense.
+
+    Query-side traits only (cheap). Empty also fires when the *index* neighbor has an
+    empty address (same idea as bm25_k_empty). Opt-in via cfg.dense_adaptive.
+    """
+    if len(dq) == 0:
+        return dq, di, ds
+    order = np.lexsort((-ds, dq))
+    dq, di, ds = dq[order], di[order], ds[order]
+    rk = rank_in_sorted_groups(dq)
+    q_nat = _nonlatin_mask(q_names)
+    i_nat = _nonlatin_mask(i_names)
+    q_empty = np.fromiter((not (a or "").strip() for a in q_addrs), bool, len(q_addrs))
+    i_empty = np.fromiter((not (a or "").strip() for a in i_addrs), bool, len(i_addrs))
+    # default budget per query
+    nq = int(dq.max()) + 1 if len(dq) else 0
+    k_q = np.full(nq, int(k_dense), dtype=np.int16)
+    easy = (~q_nat) & (~q_empty)
+    k_q[easy] = np.int16(k_easy)
+    k_q[q_empty] = np.maximum(k_q[q_empty], np.int16(k_empty))
+    k_q[q_nat] = np.maximum(k_q[q_nat], np.int16(k_script))
+    # keep if within that query's budget, OR deeper hit for non-Latin/empty index side
+    keep = rk < k_q[dq]
+    keep |= (rk < k_script) & (q_nat[dq] | i_nat[di])
+    keep |= (rk < k_empty) & (q_empty[dq] | i_empty[di])
+    return dq[keep], di[keep], ds[keep]
+
+
 def _bm25_empty_keep(bq, bi, bs, i_addrs, k_bm25: int, k_empty: int):
     """Keep the usual BM25 top-k, plus deeper hits when the index address is empty.
 
@@ -446,7 +476,7 @@ def run_blocking(cfg, split: str, s1, idx, parts, emb=None) -> dict:
             stats[ck] = dict(n_s1=len(s1_rows), n_idx=len(idx_rows), pairs=len(z["q"]))
             continue
         with timed(f"block:{split}:{ck!r} S1={len(s1_rows):,} IDX={len(idx_rows):,}"):
-            cols = BLOCK_COLS + (_TEXT_COLS if use_bm25 else [])
+            cols = BLOCK_COLS + (_TEXT_COLS if (use_bm25 or emb is not None) else [])
             Q = s1.iloc[s1_rows][cols].reset_index(drop=True)
             I = idx.iloc[idx_rows][cols].reset_index(drop=True)
             P = block_partition(Q[BLOCK_COLS], I[BLOCK_COLS], cfg)
@@ -474,19 +504,32 @@ def run_blocking(cfg, split: str, s1, idx, parts, emb=None) -> dict:
                 from dense import knn_topk
                 eq, ei = emb
                 k_script = int(getattr(cfg, "k_dense_script", 0) or 0)
-                k_take = max(cfg.k_dense, k_script)
+                adaptive = bool(getattr(cfg, "dense_adaptive", False))
+                k_empty_d = int(getattr(cfg, "k_dense_empty", 30) or 0)
+                k_easy = int(getattr(cfg, "k_dense_easy", 5) or 5)
+                k_take = max(cfg.k_dense, k_script, k_empty_d if adaptive else 0)
                 dq, di, ds = knn_topk(eq, ei, s1_rows, idx_rows, k_take)
-                if k_script > cfg.k_dense:
-                    # names are needed even when BM25 is off
+                need_names = (k_script > cfg.k_dense) or adaptive
+                if need_names and len(dq):
                     if "business_name" not in Q.columns:
                         Qn = s1.iloc[s1_rows]["business_name"].to_numpy(object)
                         In = idx.iloc[idx_rows]["business_name"].to_numpy(object)
+                        Qa = s1.iloc[s1_rows]["business_address"].to_numpy(object)
+                        Ia = idx.iloc[idx_rows]["business_address"].to_numpy(object)
                     else:
                         Qn = Q["business_name"].to_numpy(object)
                         In = I["business_name"].to_numpy(object)
+                        Qa = Q["business_address"].to_numpy(object)
+                        Ia = I["business_address"].to_numpy(object)
                     n_before = len(dq)
-                    dq, di, ds = _script_keep(dq, di, ds, Qn, In, cfg.k_dense, k_script)
-                    LOG.info("  %r dense script-keep: %d -> %d", ck, n_before, len(dq))
+                    if adaptive:
+                        dq, di, ds = _adaptive_dense_keep(
+                            dq, di, ds, Qn, In, Qa, Ia,
+                            k_easy, cfg.k_dense, k_empty_d, max(k_script, cfg.k_dense))
+                        LOG.info("  %r dense adaptive-keep: %d -> %d", ck, n_before, len(dq))
+                    elif k_script > cfg.k_dense:
+                        dq, di, ds = _script_keep(dq, di, ds, Qn, In, cfg.k_dense, k_script)
+                        LOG.info("  %r dense script-keep: %d -> %d", ck, n_before, len(dq))
                 P = merge_dense(P, dq, di, ds, cfg.k_key)
             np.savez(path, **P)
             stats[ck] = dict(n_s1=len(s1_rows), n_idx=len(idx_rows), pairs=len(P["q"]))

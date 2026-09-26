@@ -124,7 +124,51 @@ def predict_rows(models, X, fold=None):
     return p.astype(np.float32)
 
 
+def _subsample_hard_neg(y, bscore, brank, dcos, max_rows, seed):
+    """Keep ALL positives + hardest negatives up to max_rows.
+
+    Hardness ≈ blocking score + dense cos − small*brank. Falls back to random
+    among ties. Preferential for BM25/dense/key near-misses over random junk.
+    """
+    n = len(y)
+    if n <= max_rows:
+        return np.ones(n, bool)
+    y = np.asarray(y)
+    pos = y > 0
+    n_pos = int(pos.sum())
+    if n_pos >= max_rows:
+        # Extreme imbalance: keep a random pos subset (should never happen).
+        rng = np.random.default_rng(seed)
+        idx = np.flatnonzero(pos)
+        pick = rng.choice(idx, size=max_rows, replace=False)
+        keep = np.zeros(n, bool)
+        keep[pick] = True
+        LOG.warning("positives %d >= cap %d: random pos subsample", n_pos, max_rows)
+        return keep
+    n_neg = max_rows - n_pos
+    neg = np.flatnonzero(~pos)
+    bs = np.nan_to_num(np.asarray(bscore, dtype=np.float32), nan=0.0)
+    dc = np.nan_to_num(np.asarray(dcos, dtype=np.float32), nan=0.0)
+    br = np.asarray(brank, dtype=np.float32)
+    hard = bs[neg] + 0.5 * dc[neg] - 0.01 * br[neg]
+    # slight noise so order isn't fully deterministic across identical scores
+    rng = np.random.default_rng(seed)
+    hard = hard + 1e-6 * rng.random(len(neg), dtype=np.float32)
+    if len(neg) <= n_neg:
+        keep = np.ones(n, bool)
+    else:
+        # argpartition: largest n_neg hardness
+        part = np.argpartition(-hard, n_neg - 1)[:n_neg]
+        keep = pos.copy()
+        keep[neg[part]] = True
+    LOG.warning("training rows %d > cap %d: keep all %d positives + %d hard negatives "
+                "(%.1f%% of rows)", n, max_rows, n_pos, int(keep.sum()) - n_pos,
+                100.0 * keep.mean())
+    return keep
+
+
 def _subsample_groups(q_glob, max_rows, seed):
+    """Legacy group subsample — kept for callers that lack pair scores."""
     if len(q_glob) <= max_rows:
         return np.ones(len(q_glob), bool)
     ratio = max_rows / len(q_glob)
@@ -181,7 +225,7 @@ def train_all(cfg: Config) -> dict:
 
     # ---------- stage 1 ----------
     with timed("stage1: assemble matrix"):
-        Xs, ys, fs, qs = [], [], [], []
+        Xs, ys, fs, qs, bss, brs, dcs = [], [], [], [], [], [], []
         for ck, m in meta.items():
             if not m["use"]:
                 continue
@@ -193,10 +237,17 @@ def train_all(cfg: Config) -> dict:
             ys.append(m["y"][sel])
             fs.append(m["fold"][sel])
             qs.append(m["qg"][sel])
+            P = m["P"]
+            bss.append(P["bscore"][sel])
+            brs.append(P["brank"][sel])
+            dcs.append(P["dcos"][sel] if "dcos" in P else np.full(len(sel), np.nan, np.float32))
         X, y, fold, qg = (np.concatenate(Xs), np.concatenate(ys), np.concatenate(fs),
                           np.concatenate(qs))
-        del Xs
-        keep = _subsample_groups(qg, cfg.max_train_rows, cfg.seed)
+        bscore = np.concatenate(bss)
+        brank = np.concatenate(brs)
+        dcos = np.concatenate(dcs)
+        del Xs, bss, brs, dcs
+        keep = _subsample_hard_neg(y, bscore, brank, dcos, cfg.max_train_rows, cfg.seed)
         if not keep.all():
             X, y, fold = X[keep], y[keep], fold[keep]
         LOG.info("stage1 matrix %s  pos_rate=%.4f  (%.2f GB)", X.shape, y.mean(), X.nbytes / 2**30)
@@ -231,7 +282,7 @@ def train_all(cfg: Config) -> dict:
 
     # ---------- stage 2 ----------
     with timed("stage2: assemble matrix"):
-        Xs, ys, fs, qs = [], [], [], []
+        Xs, ys, fs, qs, bss, brs, dcs = [], [], [], [], [], [], []
         for ck, m in meta.items():
             if not m["use"]:
                 continue
@@ -243,10 +294,17 @@ def train_all(cfg: Config) -> dict:
             ys.append(m["y"][sel])
             fs.append(m["fold"][sel])
             qs.append(m["qg"][sel])
+            P = m["P"]
+            bss.append(P["bscore"][sel])
+            brs.append(P["brank"][sel])
+            dcs.append(P["dcos"][sel] if "dcos" in P else np.full(len(sel), np.nan, np.float32))
         X, y, fold, qg = (np.concatenate(Xs), np.concatenate(ys), np.concatenate(fs),
                           np.concatenate(qs))
-        del Xs
-        keep = _subsample_groups(qg, cfg.max_train_rows, cfg.seed + 1)
+        bscore = np.concatenate(bss)
+        brank = np.concatenate(brs)
+        dcos = np.concatenate(dcs)
+        del Xs, bss, brs, dcs
+        keep = _subsample_hard_neg(y, bscore, brank, dcos, cfg.max_train_rows, cfg.seed + 1)
         if not keep.all():
             X, y, fold = X[keep], y[keep], fold[keep]
     m2 = train_cv(X, y, fold, cfg.stage2_folds, cfg, S2_FEATURES, S2_MONOTONE_UP, "stage2")

@@ -58,6 +58,34 @@ def avail_gb() -> float:
     return psutil.virtual_memory().available / 2**30
 
 
+def _gpu_stats() -> str:
+    """Short CUDA util string, or empty if unavailable.
+
+    Never `import torch` here — that would put torch in sys.modules and trip
+    run.py's post-blocking re-exec into an infinite loop on --no-dense runs.
+    """
+    if "torch" not in sys.modules:
+        return ""
+    try:
+        import torch
+        if not torch.cuda.is_available():
+            return ""
+        free, total = torch.cuda.mem_get_info()
+        alloc = torch.cuda.memory_allocated() / 2**30
+        return f" | gpu_alloc={alloc:.1f}GB free={free / 2**30:.1f}/{total / 2**30:.1f}GB"
+    except Exception:
+        return ""
+
+
+def _cpu_pct() -> str:
+    if psutil is None:
+        return ""
+    try:
+        return f" | cpu={psutil.cpu_percent(interval=None):.0f}%"
+    except Exception:
+        return ""
+
+
 @contextlib.contextmanager
 def timed(name: str):
     t0 = time.perf_counter()
@@ -65,8 +93,9 @@ def timed(name: str):
     try:
         yield
     finally:
-        LOG.info("<< %s | %.1fs | rss=%.2f GB | avail=%.1f GB",
-                 name, time.perf_counter() - t0, rss_gb(), avail_gb())
+        dt = time.perf_counter() - t0
+        LOG.info("<< %s | %.1fs | rss=%.2f GB | avail=%.1f GB%s%s",
+                 name, dt, rss_gb(), avail_gb(), _cpu_pct(), _gpu_stats())
 
 
 def n_workers(requested: int = 0) -> int:

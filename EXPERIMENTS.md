@@ -305,3 +305,20 @@ Targets: **0.986** = top 10. **~0.999** = measured ceiling.
 - **Before → After:** holdout_stage2_f05 0.991732 → **0.991116 (−0.000617)**
   - pairs_per_s1 36.79 → **39.52** | blocking_recall flat | oracle flat/down
 - **Verdict:** **REVERT.** More pairs, no recall gain, score down.
+
+### 2026-09-26 — Runtime: unique-E5 + resume, FAISS (CUDA), fuzzy brank gate — KEEP
+- **Hypothesis:** dedup texts before E5, crash-resume encode, FAISS exact kNN, and RapidFuzz only for `brank<24` (+ dense hits) cut wall clock without hurting recall.
+- **Change:** `dense.py` unique-text encode + `.progress` resume; FAISS `IndexFlatIP` on CUDA/CPU (torch on MPS); `feat_fuzz_brank_max=24` default; `faiss-cpu` in `requirements-dense.txt`.
+- **Command:** `src/run.py train --work-dir work_speed --dev-frac 0.03 --keep-intermediates --dense-batch 256`
+- **Before → After:** holdout_stage2_f05 0.991732 → **0.991988 (+0.000256)**
+  - blocking_recall 0.996762 | oracle_f05 0.999062 | pairs_per_s1 **36.79** (unchanged)
+  - India 0.990355 → **0.990983**, US 0.992637 → **0.992648**
+  - Timings (3% Mac): E5 dedup only **0.5%** unique savings (not a win here); encode resume **works**; features India 1.27M pairs **11s** (fuzzy gate); cached resume train **1.9 min** end-to-end after embs exist
+- **Verdict:** **KEEP.** Score flat/up; features much faster. Dedup is still worth keeping for crash-resume + full-scale dupes; don’t expect big encode savings on this generator. FAISS is for GPU boxes, not MPS.
+
+### 2026-09-26 — A100 readiness: hard-neg subsample, adaptive dense (opt-in), telemetry
+- **Hypothesis:** teammate checklist — keep accuracy stack; add hard-neg training cap, optional adaptive dense-k, resource logs; don’t rebuild entity-level k (already REVERT).
+- **Change:** `_subsample_hard_neg` (all positives + hardest bscore/dcos/brank negatives); `dense_adaptive` + `k_dense_easy/empty` (default **off**); `timed()` logs cpu% + gpu mem only if torch already loaded (fixed infinite re-exec when `_gpu_stats` imported torch); `scripts/run_a100.sh`.
+- **Already true (no change):** stage caches, mmap features, pair dedup in `merge_extra`, fuzzy gate@24, fold crc, max_train_rows=30M, script/empty BM25 adaptive.
+- **Command:** `tests/smoke_test.py` → **PASS**. Adaptive / hard-neg full-slice measure: **pending** (`--dense-adaptive` on `--dev-frac 0.03` before promote).
+- **Verdict:** **KEEP plumbing.** Do not enable `--dense-adaptive` on A100 until 3% then 0.3 measure. Entity-level k selection stays off.

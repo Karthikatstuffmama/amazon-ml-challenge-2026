@@ -76,6 +76,14 @@ def parse_args(argv=None):
     ap.add_argument("--no-monotone", action="store_true")
     ap.add_argument("--lgb-rounds", type=int, default=None)
     ap.add_argument("--min-leaf", type=int, default=None)
+    ap.add_argument("--feat-fuzz-brank-max", type=int, default=None,
+                    help="RapidFuzz only for brank<N (+ dense hits); 0=all (default 24)")
+    ap.add_argument("--feat-chunk", type=int, default=None,
+                    help="pairs per feature chunk (raise on high-RAM boxes, e.g. 5000000)")
+    ap.add_argument("--join-budget-rows", type=int, default=None,
+                    help="blocking join RAM guard (raise on >=64GB RAM, e.g. 80000000)")
+    ap.add_argument("--dense-adaptive", action=argparse.BooleanOptionalAction, default=None,
+                    help="per-query dense k: easy/empty/non-Latin budgets (measure before promote)")
     return ap.parse_args(argv)
 
 
@@ -121,6 +129,14 @@ def build_config(a) -> Config:
         cfg.lgb_rounds = a.lgb_rounds
     if a.min_leaf:
         cfg.lgb_min_leaf = a.min_leaf
+    if a.feat_fuzz_brank_max is not None:
+        cfg.feat_fuzz_brank_max = a.feat_fuzz_brank_max
+    if a.feat_chunk is not None:
+        cfg.feat_chunk = a.feat_chunk
+    if a.join_budget_rows is not None:
+        cfg.join_budget_rows = a.join_budget_rows
+    if a.dense_adaptive is not None:
+        cfg.dense_adaptive = a.dense_adaptive
     for sub in ("train", "test"):
         p = os.path.join(cfg.data_dir, sub)
         if not os.path.isdir(p):

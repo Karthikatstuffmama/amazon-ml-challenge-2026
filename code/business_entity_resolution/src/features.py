@@ -172,11 +172,27 @@ class PartitionFeaturizer:
         self.emb_q, self.emb_i = emb_q, emb_i
 
     # ------------------------------------------------------------------ #
-    def _cp(self, a, b, scorer, scale=100.0):
-        if len(a) == 0:
+    def _cp(self, a, b, scorer, scale=100.0, skip=None):
+        """Pairwise string scores. Skips empty/gated via `skip` (True=leave NaN)
+        and short-circuits exact string equals to 1.0 without calling rapidfuzz.
+        """
+        n = len(a)
+        if n == 0:
             return np.zeros(0, np.float32)
-        r = process.cpdist(a, b, scorer=scorer, workers=self.W, dtype=np.float32)
-        return (r / scale).astype(np.float32)
+        out = np.full(n, np.nan, dtype=np.float32)
+        need = np.ones(n, dtype=bool) if skip is None else ~np.asarray(skip, dtype=bool)
+        aa = np.asarray(a, dtype=object)
+        bb = np.asarray(b, dtype=object)
+        same = need & (aa == bb)
+        out[same] = 1.0
+        need = need & ~same
+        idx = np.flatnonzero(need)
+        if len(idx) == 0:
+            return out
+        r = process.cpdist(aa[idx].tolist(), bb[idx].tolist(),
+                           scorer=scorer, workers=self.W, dtype=np.float32)
+        out[idx] = (r / scale).astype(np.float32)
+        return out
 
     def chunk(self, qc, ic, P, sl, emb_rows=None):
         """Base features for pairs (qc, ic); P holds blocking arrays; sl the slice."""
@@ -188,31 +204,41 @@ class PartitionFeaturizer:
         def put(name, v):
             F[:, col[name]] = v
 
+        # Two-stage gate: expensive RapidFuzz only for top-brank (and dense hits).
+        # brank is 0-based within the key-union list. 0 = off (all pairs get fuzzy).
+        fuzz_k = int(getattr(self.cfg, "feat_fuzz_brank_max", 0) or 0)
+        bits = P["bits"][sl]
+        if fuzz_k > 0:
+            br = P["brank"][sl]
+            dense_hit = ((bits >> T_DENSE) & 1).astype(bool)
+            do_fuzz = (br < fuzz_k) | dense_hit
+        else:
+            do_fuzz = np.ones(n, dtype=bool)
+
         qn, inn = Q["n_core"][qc], I["n_core"][ic]
         qn_l, in_l = qn.tolist(), inn.tolist()
         ne = (self.len_nq[qc] == 0) | (self.len_ni[ic] == 0)
+        skip_name = ne | ~do_fuzz
         for name, scorer in (("n_ratio", fuzz.ratio), ("n_pratio", fuzz.partial_ratio),
                              ("n_tsort", fuzz.token_sort_ratio),
                              ("n_tset", fuzz.token_set_ratio)):
-            v = self._cp(qn_l, in_l, scorer)
-            v[ne] = np.nan
-            put(name, v)
-        v = self._cp(qn_l, in_l, distance.JaroWinkler.normalized_similarity, 1.0)
-        v[ne] = np.nan
-        put("n_jw", v)
+            put(name, self._cp(qn_l, in_l, scorer, skip=skip_name))
+        put("n_jw", self._cp(qn_l, in_l, distance.JaroWinkler.normalized_similarity,
+                             1.0, skip=skip_name))
         qf, if_ = Q["n_full"][qc].tolist(), I["n_full"][ic].tolist()
-        put("n_lev_full", self._cp(qf, if_, distance.Levenshtein.normalized_similarity, 1.0))
-        put("n_tset_full", self._cp(qf, if_, fuzz.token_set_ratio))
+        put("n_lev_full", self._cp(qf, if_, distance.Levenshtein.normalized_similarity,
+                                   1.0, skip=skip_name))
+        put("n_tset_full", self._cp(qf, if_, fuzz.token_set_ratio, skip=skip_name))
         qc_l, ic_l = Q["n_concat"][qc].tolist(), I["n_concat"][ic].tolist()
-        put("n_concat_ratio", self._cp(qc_l, ic_l, fuzz.ratio))
-        put("n_concat_pratio", self._cp(qc_l, ic_l, fuzz.partial_ratio))
+        put("n_concat_ratio", self._cp(qc_l, ic_l, fuzz.ratio, skip=skip_name))
+        put("n_concat_pratio", self._cp(qc_l, ic_l, fuzz.partial_ratio, skip=skip_name))
         put("n_skel_ratio", self._cp(Q["n_skel"][qc].tolist(), I["n_skel"][ic].tolist(),
-                                     fuzz.token_sort_ratio))
+                                     fuzz.token_sort_ratio, skip=skip_name))
         put("n_phon_ratio", self._cp(Q["n_phon"][qc].tolist(), I["n_phon"][ic].tolist(),
-                                     fuzz.token_set_ratio))
-        al_a = self._cp(qn_l, I["n_alt_a"][ic].tolist(), fuzz.token_set_ratio)
-        al_b = self._cp(qn_l, I["n_alt_b"][ic].tolist(), fuzz.token_set_ratio)
-        put("n_alias_best", np.maximum(al_a, al_b))
+                                     fuzz.token_set_ratio, skip=skip_name))
+        al_a = self._cp(qn_l, I["n_alt_a"][ic].tolist(), fuzz.token_set_ratio, skip=skip_name)
+        al_b = self._cp(qn_l, I["n_alt_b"][ic].tolist(), fuzz.token_set_ratio, skip=skip_name)
+        put("n_alias_best", np.fmax(al_a, al_b))
         put("n_cos_char", rowdot(*self.m_nchar, qc, ic))
         put("n_cos_word", rowdot(*self.m_nword, qc, ic))
         inter = rowdot(*self.m_nbin, qc, ic)
@@ -230,21 +256,17 @@ class PartitionFeaturizer:
         a_empty = I["a_empty"][ic]
         put("a_empty_i", a_empty)
         ae = (a_empty > 0) | (Q["a_empty"][qc] > 0)
+        skip_addr = ae | ~do_fuzz
         qa, ia = Q["a_full"][qc].tolist(), I["a_full"][ic].tolist()
         for name, scorer in (("a_ratio", fuzz.ratio), ("a_tsort", fuzz.token_sort_ratio),
                              ("a_tset", fuzz.token_set_ratio), ("a_pratio", fuzz.partial_ratio)):
-            v = self._cp(qa, ia, scorer)
-            v[ae] = np.nan
-            put(name, v)
-        v = self._cp(Q["a_core"][qc].tolist(), I["a_core"][ic].tolist(), fuzz.token_set_ratio)
-        v[ae] = np.nan
-        put("a_core_tset", v)
-        v = self._cp(Q["a_alpha"][qc].tolist(), I["a_alpha"][ic].tolist(), fuzz.token_set_ratio)
-        v[ae] = np.nan
-        put("a_alpha_tset", v)
-        v = self._cp(Q["a_skel"][qc].tolist(), I["a_skel"][ic].tolist(), fuzz.token_set_ratio)
-        v[ae] = np.nan
-        put("a_skel_ratio", v)
+            put(name, self._cp(qa, ia, scorer, skip=skip_addr))
+        put("a_core_tset", self._cp(Q["a_core"][qc].tolist(), I["a_core"][ic].tolist(),
+                                    fuzz.token_set_ratio, skip=skip_addr))
+        put("a_alpha_tset", self._cp(Q["a_alpha"][qc].tolist(), I["a_alpha"][ic].tolist(),
+                                     fuzz.token_set_ratio, skip=skip_addr))
+        put("a_skel_ratio", self._cp(Q["a_skel"][qc].tolist(), I["a_skel"][ic].tolist(),
+                                     fuzz.token_set_ratio, skip=skip_addr))
         v = rowdot(*self.m_aword, qc, ic)
         v[ae] = np.nan
         put("a_cos_word", v)

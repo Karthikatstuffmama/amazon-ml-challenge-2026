@@ -51,10 +51,19 @@ class Config:
     dense_batch: int = 256            # knee on M5 Air MPS; CUDA auto-ramps higher
     dense_batch_fixed: bool = False   # True => skip the encode batch probe
     dense_max_len: int = 64
+    # Adaptive per-query dense budget (opt-in). easy→k_dense_easy, empty→k_dense_empty,
+    # non-Latin→k_dense_script, else k_dense. Measure on --dev-frac 0.03 before promoting.
+    dense_adaptive: bool = False
+    k_dense_easy: int = 5
+    k_dense_empty: int = 30
 
     # ---------------- features ------------
     feat_chunk: int = 2_000_000       # pairs per feature chunk
     hash_features: int = 2 ** 20      # hashing-trick width for TF-IDF
+    # Two-stage RapidFuzz: only pairs with brank < this (plus any dense hit) get
+    # expensive fuzzy scores; others leave those cols as NaN (LightGBM-ok).
+    # 0 = off (all pairs). Default 24 ≈ keep top key-ranks; measured for speed.
+    feat_fuzz_brank_max: int = 24
 
     # ---------------- training ------------
     stage1_folds: list = field(default_factory=lambda: [0, 1, 2])
@@ -88,4 +97,5 @@ class Config:
 # Settings that change the *meaning* of features; must be identical at train and test.
 FEATURE_CONTRACT = ("k_key", "k_dense", "k_dense_script", "name_topk", "addr_topk", "num_topk",
                     "max_df_pair", "max_df_name", "max_pairs_per_key", "bm25_k", "bm25_k_empty",
-                    "dense", "dense_model", "hash_features")
+                    "dense", "dense_model", "hash_features", "feat_fuzz_brank_max",
+                    "dense_adaptive", "k_dense_easy", "k_dense_empty")

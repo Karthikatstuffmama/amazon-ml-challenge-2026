@@ -1,15 +1,19 @@
-"""Optional GPU/MPS pass: multilingual sentence embeddings + exact chunked kNN.
+"""Optional GPU/MPS pass: multilingual sentence embeddings + top-k dense retrieval.
 
 Model: intfloat/multilingual-e5-small (MIT, 118M params) - reads Devanagari, Kannada,
 Tamil, Telugu, Bengali, Gujarati and French natively, so it recovers cross-script
 matches that transliteration + keys miss. Enabled with --dense. Embeddings are
 L2-normalised fp16 memmaps (N x 384 x 2 bytes) cached on disk.
 
-kNN is exact brute force (Q @ I^T + topk), chunked on query and index axes.
-Optimised for CUDA and Apple MPS (MacBook); falls back to threaded CPU.
+Encode path: hash unique `name|addr` strings, embed once, scatter back (big win when
+duplicates are common). Crash-safe: resumes from `emb_*.npy.tmp` + `.progress`.
+
+kNN: FAISS IndexFlatIP when available (exact cosine on L2-normalised vectors), else
+chunked torch gemm. Same top-k semantics either way.
 """
 from __future__ import annotations
 
+import hashlib
 import os
 import time
 
@@ -86,8 +90,42 @@ def build_embeddings(cfg, split: str, s1, idx):
     return tuple(out)
 
 
+def _unique_order(texts: list[str]):
+    """First-occurrence unique strings + inverse map (row -> unique index)."""
+    index: dict[str, int] = {}
+    uniq: list[str] = []
+    inv = np.empty(len(texts), dtype=np.int32)
+    for i, t in enumerate(texts):
+        j = index.get(t)
+        if j is None:
+            j = len(uniq)
+            index[t] = j
+            uniq.append(t)
+        inv[i] = j
+    return uniq, inv
+
+
+def _progress_path(tmp: str) -> str:
+    return tmp + ".progress"
+
+
+def _load_progress(prog: str) -> int:
+    if not os.path.exists(prog):
+        return 0
+    try:
+        with open(prog, "r", encoding="utf-8") as f:
+            return max(0, int(f.read().strip() or "0"))
+    except (ValueError, OSError):
+        return 0
+
+
+def _save_progress(prog: str, done: int) -> None:
+    with open(prog, "w", encoding="utf-8") as f:
+        f.write(str(int(done)))
+
+
 def _encode_to(path, texts, cfg):
-    """Encode corpus → fp16 memmap with auto-tuned batch + inference_mode.
+    """Encode corpus → fp16 memmap with unique-text dedup + crash resume.
 
     Stages stay sequential (S1 then idx; countries later). Inside each chunk the
     accelerator parallelises the matmul — that is the safe parallelism on 16 GB.
@@ -101,6 +139,12 @@ def _encode_to(path, texts, cfg):
     os.environ.setdefault("MKL_NUM_THREADS", str(ncpu))
     os.environ.setdefault("VECLIB_MAXIMUM_THREADS", str(ncpu))
 
+    n = len(texts)
+    uniq, inv = _unique_order(texts)
+    nu = len(uniq)
+    LOG.info("    dense dedup: %d rows -> %d unique texts (%.1f%%)",
+             n, nu, 100.0 * nu / max(1, n))
+
     dev, use_fp16 = _pick_device()
     model = SentenceTransformer(cfg.dense_model, device=dev)
     model.max_seq_length = cfg.dense_max_len
@@ -110,7 +154,8 @@ def _encode_to(path, texts, cfg):
 
     base = int(cfg.dense_batch)
     if dev == "cuda":
-        cands = sorted({max(base, 512), 512, 768, 1024, 1536})
+        # A100 80GB: e5-small is tiny — probe up through 4096.
+        cands = sorted({max(base, 1024), 1024, 1536, 2048, 3072, 4096})
     elif dev == "mps":
         # Empirically ~256 is the knee on M5 Air; 1024 hung. Probe around the knee.
         cands = [128, 256, 384, 512, 640]
@@ -121,66 +166,146 @@ def _encode_to(path, texts, cfg):
         batch = int(cfg.dense_batch)
         LOG.info("    pinned encode batch=%d on %s (probe skipped)", batch, dev)
     else:
-        probe_n = min(len(texts), max(cands) * 2, 2048)
-        batch = _best_batch(model, texts[:probe_n], cands, dev) if len(texts) >= 256 else cands[0]
+        probe_n = min(nu, max(cands) * 2, 8192 if dev == "cuda" else 2048)
+        batch = _best_batch(model, uniq[:probe_n], cands, dev) if nu >= 256 else cands[0]
         LOG.info("    selected encode batch=%d on %s", batch, dev)
 
     dim = model.get_sentence_embedding_dimension()
-    n = len(texts)
-    tmp = path + ".tmp.npy"
-    mm = np.lib.format.open_memmap(tmp, mode="w+", dtype=np.float16, shape=(n, dim))
-    # Larger steps = less Python overhead; still sequential chunks.
-    step = max(batch * 16, 8192)
+    tmp_u = path + ".uniq.tmp.npy"
+    prog = _progress_path(tmp_u)
+    # Fingerprint so a resumed file matches this unique set.
+    finger = hashlib.sha1(("\n".join(uniq[:100]) + f"\n#n={nu}\n#dim={dim}").encode()).hexdigest()[:16]
+    meta = path + ".uniq.meta"
+    resume_from = 0
+    if (os.path.exists(tmp_u) and os.path.exists(meta) and not cfg.force
+            and open(meta, encoding="utf-8").read().strip() == finger):
+        resume_from = _load_progress(prog)
+        LOG.info("    dense resume: continuing unique encode from %d / %d", resume_from, nu)
+        mm_u = np.lib.format.open_memmap(tmp_u, mode="r+")
+        if mm_u.shape != (nu, dim):
+            del mm_u
+            resume_from = 0
+    if resume_from == 0:
+        mm_u = np.lib.format.open_memmap(tmp_u, mode="w+", dtype=np.float16, shape=(nu, dim))
+        with open(meta, "w", encoding="utf-8") as f:
+            f.write(finger)
+
+    # Larger encode steps on CUDA — less Python overhead, VRAM absorbs it.
+    step = max(batch * (32 if dev == "cuda" else 16), 8192)
     t_start = time.perf_counter()
-    with timed(f"dense:encode {os.path.basename(path)} n={n:,} on {dev} batch={batch} step={step}"):
+    with timed(f"dense:encode-unique {os.path.basename(path)} uniq={nu:,}/{n:,} "
+               f"on {dev} batch={batch}"):
         with torch.inference_mode():
-            for i, s in enumerate(range(0, n, step)):
+            for i, s in enumerate(range(resume_from, nu, step)):
                 e = model.encode(
-                    texts[s:s + step],
+                    uniq[s:s + step],
                     batch_size=batch,
                     normalize_embeddings=True,
                     convert_to_numpy=True,
                     show_progress_bar=False,
                 )
-                mm[s:s + len(e)] = e.astype(np.float16)
+                mm_u[s:s + len(e)] = e.astype(np.float16)
                 done = s + len(e)
+                _save_progress(prog, done)
                 elapsed = max(1e-6, time.perf_counter() - t_start)
-                LOG.info("    encoded %d / %d (%.0f%%)  %.0f rows/s",
-                         done, n, 100.0 * done / n, done / elapsed)
-                # Reclaim rarely — empty_cache every step killed throughput.
+                # rate over this session only (resume-friendly)
+                session = done - resume_from
+                LOG.info("    unique-encoded %d / %d (%.0f%%)  %.0f uniq/s",
+                         done, nu, 100.0 * done / nu, session / elapsed)
                 if dev == "mps" and (i + 1) % 8 == 0:
                     torch.mps.empty_cache()
+    mm_u.flush()
+
+    # Scatter unique → full row memmap.
+    tmp = path + ".tmp.npy"
+    mm = np.lib.format.open_memmap(tmp, mode="w+", dtype=np.float16, shape=(n, dim))
+    with timed(f"dense:scatter {os.path.basename(path)} n={n:,}"):
+        # chunked take to bound RAM
+        scat_step = 1_000_000
+        for s in range(0, n, scat_step):
+            e = min(n, s + scat_step)
+            mm[s:e] = mm_u[inv[s:e]]
     mm.flush()
-    del mm
+    del mm, mm_u
+    for p in (tmp_u, prog, meta):
+        try:
+            os.remove(p)
+        except OSError:
+            pass
     os.replace(tmp, path)
 
 
-def knn_topk(emb_q, emb_i, q_rows, i_rows, k):
-    """Exact top-k cosine for rows q_rows of emb_q against rows i_rows of emb_i.
+def _knn_faiss(emb_q, emb_i, q_rows, i_rows, k):
+    """Exact IP top-k via FAISS (CPU or GPU). Same answers as torch on L2-normed vectors."""
+    import faiss
+    q_rows = np.asarray(q_rows)
+    i_rows = np.asarray(i_rows)
+    nq, ni = len(q_rows), len(i_rows)
+    k = int(min(k, ni))
+    I = np.ascontiguousarray(emb_i[i_rows], dtype=np.float32)
+    faiss.normalize_L2(I)
+    cpu_index = faiss.IndexFlatIP(I.shape[1])
+    backend = "cpu"
+    index = cpu_index
+    try:
+        # faiss-gpu / conda faiss with CUDA — no-op failure on faiss-cpu wheels
+        ngpu = faiss.get_num_gpus()
+        if ngpu > 0:
+            res = faiss.StandardGpuResources()
+            # Cap temp memory so we don't grab the whole A100 for one country partition.
+            res.setTempMemory(2 * 1024 ** 3)
+            index = faiss.index_cpu_to_gpu(res, 0, cpu_index)
+            backend = f"gpu0/{ngpu}"
+    except Exception as e:  # noqa: BLE001
+        LOG.info("    faiss GPU unavailable (%s); using CPU IndexFlatIP", type(e).__name__)
+        index = cpu_index
+    index.add(I)
+    Q = np.ascontiguousarray(emb_q[q_rows], dtype=np.float32)
+    faiss.normalize_L2(Q)
+    # Batched queries — don't put all Q in one shot on huge countries.
+    q_batch = 65_536 if backend.startswith("gpu") else min(nq, 262_144)
+    ss_parts, ix_parts = [], []
+    with timed(f"dense:knn-faiss nq={nq:,} ni={ni:,} k={k} backend={backend} qbatch={q_batch}"):
+        for s0 in range(0, nq, q_batch):
+            s1 = min(nq, s0 + q_batch)
+            D, Ix = index.search(Q[s0:s1], k)
+            ss_parts.append(D)
+            ix_parts.append(Ix)
+    ss = np.concatenate(ss_parts, axis=0)
+    ix = np.concatenate(ix_parts, axis=0)
+    qq = np.repeat(np.arange(nq, dtype=np.int32), k)
+    ii = ix.reshape(-1).astype(np.int32)
+    sc = ss.reshape(-1).astype(np.float32)
+    m = (ii >= 0) & (sc > -1.5)
+    return qq[m], ii[m], sc[m]
 
-    Returns local indices (into q_rows / i_rows) and similarities, sorted by q.
-    Tuned for MPS: keep working tensors on-device, larger chunks, infrequent cache clears.
-    """
+
+def _knn_torch(emb_q, emb_i, q_rows, i_rows, k):
+    """Exact top-k cosine via chunked gemm (CUDA / MPS / CPU)."""
     import torch
     dev_s, _ = _pick_device()
     dev = torch.device(dev_s)
     dt = torch.float16 if dev_s == "cuda" else torch.float32
     nq, ni = len(q_rows), len(i_rows)
     k = int(min(k, ni))
-    if nq == 0 or k == 0:
-        return (np.zeros(0, np.int32), np.zeros(0, np.int32), np.zeros(0, np.float32))
 
     if dev_s == "cuda":
         free, _ = torch.cuda.mem_get_info()
+        # A100 80GB: use most of free VRAM for larger gemm tiles.
+        mem_frac_i, mem_frac_q = 0.70, 0.40
+        qc_cap = 32_768
     elif dev_s == "mps":
-        # Unified memory: push harder than the old 2 GB cap (was leaving M5 idle).
         free = 6 * 2**30
+        mem_frac_i, mem_frac_q = 0.45, 0.25
+        qc_cap = 8192
     else:
         free = 3 * 2**30
+        mem_frac_i, mem_frac_q = 0.45, 0.25
+        qc_cap = 8192
     dim = emb_i.shape[1]
     bpe = 2 if dt == torch.float16 else 4
-    ic = int(max(50_000, min(ni, 0.45 * free / (dim * bpe))))
-    qc = int(max(128, min(8192, 0.25 * free / (max(ic, 1) * bpe))))
+    ic = int(max(50_000, min(ni, mem_frac_i * free / (dim * bpe))))
+    qc = int(max(128, min(qc_cap, mem_frac_q * free / (max(ic, 1) * bpe))))
     i_rows = np.asarray(i_rows)
     q_rows = np.asarray(q_rows)
 
@@ -220,3 +345,23 @@ def knn_topk(emb_q, emb_i, q_rows, i_rows, k):
     ss = v.reshape(-1).astype(np.float32)
     m = ss > -1.5
     return qq[m], ii[m], ss[m]
+
+
+def knn_topk(emb_q, emb_i, q_rows, i_rows, k):
+    """Exact top-k cosine for rows q_rows of emb_q against rows i_rows of emb_i.
+
+    Preference: FAISS GPU → FAISS CPU → torch gemm.
+    MPS: torch only (FAISS+unified memory OOM'd on Mac).
+    """
+    nq, ni = len(q_rows), len(i_rows)
+    k = int(min(k, ni))
+    if nq == 0 or k == 0:
+        return (np.zeros(0, np.int32), np.zeros(0, np.int32), np.zeros(0, np.float32))
+    dev_s, _ = _pick_device()
+    if dev_s != "mps":
+        try:
+            import faiss  # noqa: F401
+            return _knn_faiss(emb_q, emb_i, q_rows, i_rows, k)
+        except Exception as e:  # noqa: BLE001
+            LOG.info("    faiss unavailable (%s); using torch knn", type(e).__name__)
+    return _knn_torch(emb_q, emb_i, q_rows, i_rows, k)
